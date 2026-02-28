@@ -244,6 +244,8 @@ def _reset_strategy_module():
     # Reset vol MM state
     if hasattr(strat_mod, '_vmm_state'):
         strat_mod._vmm_state = strat_mod._VMMState()
+    # Reset shared position cache
+    strat_mod._positions = {}
 
 
 def run_backtest(
@@ -296,6 +298,9 @@ def run_backtest(
     bot = MockBot()
     pnl = PnLTracker()
     bot._sim_positions = pnl.positions  # wire up so strategies see positions
+
+    # Also push positions into strategy module's shared cache
+    strat_mod._positions = pnl.positions
 
     signals_emitted = 0
     signals_by_strategy: dict[str, int] = {}

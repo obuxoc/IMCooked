@@ -42,6 +42,54 @@ from dataclasses import dataclass, field
 
 
 # =========================================================================
+# SHARED POSITION CACHE — updated by run.py, read by all strategies
+# =========================================================================
+# This avoids each strategy calling bot.get_positions() (an API call).
+# run.py calls update_positions() every main-loop tick (~10s).
+
+_positions: dict[str, int] = {}
+_POSITION_SOFT_LIMIT = 40   # start being careful above this
+_POSITION_HARD_LIMIT = 60   # only allow risk-reducing trades above this
+
+
+def update_positions(positions: dict[str, int]) -> None:
+    """Called by run.py to push exchange positions into strategy module."""
+    global _positions
+    _positions = dict(positions)
+
+
+def get_position(product: str) -> int:
+    """Get cached net position for a product.  0 if unknown."""
+    return _positions.get(product, 0)
+
+
+def _would_increase_risk(product: str, side: Side) -> bool:
+    """True if this trade would push position further from zero."""
+    pos = get_position(product)
+    if side == Side.BUY and pos > 0:
+        return True
+    if side == Side.SELL and pos < 0:
+        return True
+    return False
+
+
+def _position_guard(product: str, side: Side) -> bool:
+    """Return True if the trade is BLOCKED by position limits.
+    
+    - Above SOFT_LIMIT: block risk-increasing trades
+    - Below SOFT_LIMIT: always allow
+    """
+    pos = get_position(product)
+    # Above soft limit — only allow risk-reducing
+    if abs(pos) >= _POSITION_SOFT_LIMIT:
+        if side == Side.BUY and pos > 0:
+            return True   # blocked: already long, don't buy more
+        if side == Side.SELL and pos < 0:
+            return True   # blocked: already short, don't sell more
+    return False
+
+
+# =========================================================================
 # PRICE HISTORY TRACKER (shared state for all strategies)
 # =========================================================================
 
@@ -173,6 +221,10 @@ def grid_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Signal]
     _grid_level_idx[product] = idx + 1
 
     if idx < levels:
+        side = Side.BUY
+        # ── Position guard: don't buy if already too long ──
+        if _position_guard(product, side):
+            return None
         frac = (idx + 1) / levels
         price = center - width * frac
         if price <= 0:
@@ -180,20 +232,24 @@ def grid_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Signal]
         _grid_last_signal[product] = now
         return Signal(
             product=product,
-            side=Side.BUY,
+            side=side,
             price=price,
             volume=vol,
             order_type=OrderType.GTC,
             reason=f"GRID buy L{idx+1}/{levels} @ {price:.0f} (ctr={center:.0f})",
         )
     else:
+        side = Side.SELL
+        # ── Position guard: don't sell if already too short ──
+        if _position_guard(product, side):
+            return None
         sell_idx = idx - levels
         frac = (sell_idx + 1) / levels
         price = center + width * frac
         _grid_last_signal[product] = now
         return Signal(
             product=product,
-            side=Side.SELL,
+            side=side,
             price=price,
             volume=vol,
             order_type=OrderType.GTC,
@@ -205,11 +261,12 @@ def grid_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Signal]
 # STRATEGY 2: ETF ARBITRAGE (enhanced)
 # =========================================================================
 
-ARB_THRESHOLD = 15.0
-ARB_AGGRESSIVE_THRESHOLD = 80.0
+ARB_THRESHOLD = 50.0             # widened: 15→50 to avoid constant micro-arb fills
+ARB_AGGRESSIVE_THRESHOLD = 150.0  # widened: 80→150
 ARB_VOLUME = 2
-ARB_LARGE_VOLUME = 4
-ARB_MIN_INTERVAL = 2.0
+ARB_LARGE_VOLUME = 3              # reduced: 4→3
+ARB_MIN_INTERVAL = 3.0            # slowed: 2→3s
+ARB_MAX_ETF_POS = 30              # cap: stop arbing if ETF position > ±30
 
 _arb_last_trade: float = 0.0
 
@@ -240,9 +297,26 @@ def etf_arb_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Sign
     if etf is None or math.isnan(etf.best_bid) or math.isnan(etf.best_ask):
         return None
 
+    # ── Position cap: stop piling into ETF ──
+    etf_pos = get_position("LON_ETF")
+    if abs(etf_pos) >= ARB_MAX_ETF_POS:
+        # Only allow risk-reducing arb trades
+        if gap > 0 and etf_pos < 0:  # would sell, already short → blocked
+            return None
+        if gap < 0 and etf_pos > 0:  # would buy, already long → blocked
+            return None
+        if gap > 0 and etf_pos > 0:  # sell when long → OK (reducing)
+            pass
+        elif gap < 0 and etf_pos < 0:  # buy when short → OK (reducing)
+            pass
+        else:
+            return None
+
     vol = ARB_LARGE_VOLUME if abs_gap > ARB_AGGRESSIVE_THRESHOLD else ARB_VOLUME
 
     if gap > 0:
+        if _position_guard("LON_ETF", Side.SELL):
+            return None
         _arb_last_trade = now
         return Signal(
             product="LON_ETF",
@@ -250,10 +324,12 @@ def etf_arb_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Sign
             price=etf.best_bid,
             volume=vol,
             order_type=OrderType.IOC,
-            reason=f"ARB gap={gap:+.0f} SELL ETF",
+            reason=f"ARB gap={gap:+.0f} SELL ETF (pos={etf_pos})",
             urgency=min(1.0, abs_gap / 100),
         )
     else:
+        if _position_guard("LON_ETF", Side.BUY):
+            return None
         _arb_last_trade = now
         return Signal(
             product="LON_ETF",
@@ -261,7 +337,7 @@ def etf_arb_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Sign
             price=etf.best_ask,
             volume=vol,
             order_type=OrderType.IOC,
-            reason=f"ARB gap={gap:+.0f} BUY ETF",
+            reason=f"ARB gap={gap:+.0f} BUY ETF (pos={etf_pos})",
             urgency=min(1.0, abs_gap / 100),
         )
 
@@ -307,6 +383,14 @@ def component_arb_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optiona
     if abs(divergence) < COMP_ARB_THRESHOLD:
         return None
 
+    # ── Position guard ──
+    if divergence < 0:
+        if _position_guard(snap.product, Side.BUY):
+            return None
+    else:
+        if _position_guard(snap.product, Side.SELL):
+            return None
+
     _comp_arb_last[snap.product] = now
 
     if divergence < 0:
@@ -316,7 +400,7 @@ def component_arb_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optiona
             price=snap.best_ask,
             volume=2,
             order_type=OrderType.IOC,
-            reason=f"COMP_ARB {snap.product} cheap div={divergence:.3f}",
+            reason=f"COMP_ARB {snap.product} cheap div={divergence:.3f} (pos={get_position(snap.product)})",
         )
     else:
         return Signal(
@@ -325,7 +409,7 @@ def component_arb_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optiona
             price=snap.best_bid,
             volume=2,
             order_type=OrderType.IOC,
-            reason=f"COMP_ARB {snap.product} rich div={divergence:.3f}",
+            reason=f"COMP_ARB {snap.product} rich div={divergence:.3f} (pos={get_position(snap.product)})",
         )
 
 
@@ -373,7 +457,14 @@ def fly_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Signal]:
     if abs(gap) < FLY_THRESHOLD:
         return None
 
+    # ── Position guard ──
+    if gap > 0 and _position_guard("LON_FLY", Side.SELL):
+        return None
+    if gap < 0 and _position_guard("LON_FLY", Side.BUY):
+        return None
+
     _fly_last = now
+    fly_pos = get_position("LON_FLY")
 
     if gap > 0:
         return Signal(
@@ -382,7 +473,7 @@ def fly_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Signal]:
             price=snap.best_bid,
             volume=2,
             order_type=OrderType.IOC,
-            reason=f"FLY gap={gap:+.0f} fair={fair_fly:.0f} SELL",
+            reason=f"FLY gap={gap:+.0f} fair={fair_fly:.0f} SELL (pos={fly_pos})",
         )
     else:
         return Signal(
@@ -391,7 +482,7 @@ def fly_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Signal]:
             price=snap.best_ask,
             volume=2,
             order_type=OrderType.IOC,
-            reason=f"FLY gap={gap:+.0f} fair={fair_fly:.0f} BUY",
+            reason=f"FLY gap={gap:+.0f} fair={fair_fly:.0f} BUY (pos={fly_pos})",
         )
 
 
@@ -460,12 +551,20 @@ def mean_revert_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[
 # STRATEGY 6: INVENTORY UNWIND
 # =========================================================================
 
-UNWIND_INTERVAL = 5.0
+UNWIND_INTERVAL = 3.0              # faster: 5→3s
+UNWIND_THRESHOLD = 15              # start unwinding above ±15 position
+UNWIND_AGGRESSIVE_THRESHOLD = 40   # aggressive IOC above ±40
 _unwind_last: dict[str, float] = {}
 
 
 def inventory_unwind_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Signal]:
-    """Passively unwind large positions via favorable limit orders."""
+    """Actively unwind large positions using real net positions.
+
+    Uses cached positions (not order book own-vol) to decide:
+    - pos > +15: place sell limit orders to reduce
+    - pos > +40: use IOC to aggressively reduce
+    - Scales volume with position size (bigger pos → more aggressive)
+    """
     _update_tracker(snap)
 
     product = snap.product
@@ -474,34 +573,50 @@ def inventory_unwind_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Opti
     if now - _unwind_last.get(product, 0) < UNWIND_INTERVAL:
         return None
 
-    if math.isnan(snap.mid):
+    if math.isnan(snap.mid) or math.isnan(snap.spread) or snap.spread <= 0:
         return None
 
-    own_bid = snap.total_own_bid_vol
-    own_ask = snap.total_own_ask_vol
+    pos = get_position(product)
+    abs_pos = abs(pos)
 
-    if own_bid > own_ask + 10:
-        _unwind_last[product] = now
+    if abs_pos < UNWIND_THRESHOLD:
+        return None
+
+    # Scale volume with urgency: 1-5 based on position size
+    vol = min(5, max(1, abs_pos // 15))
+    aggressive = abs_pos >= UNWIND_AGGRESSIVE_THRESHOLD
+    order_type = OrderType.IOC if aggressive else OrderType.GTC
+
+    _unwind_last[product] = now
+
+    if pos > 0:
+        # Too long → sell to reduce
+        if aggressive:
+            price = snap.best_bid  # hit the bid to get out
+        else:
+            price = snap.mid + snap.spread * 0.2  # passive sell above mid
         return Signal(
             product=product,
             side=Side.SELL,
-            price=snap.mid + snap.spread * 0.3,
-            volume=2,
-            order_type=OrderType.GTC,
-            reason=f"UNWIND own_bid={own_bid} > own_ask={own_ask}",
+            price=price,
+            volume=vol,
+            order_type=order_type,
+            reason=f"UNWIND pos={pos:+d} vol={vol} {'AGG' if aggressive else 'PASS'}",
         )
-    elif own_ask > own_bid + 10:
-        _unwind_last[product] = now
+    else:
+        # Too short → buy to reduce
+        if aggressive:
+            price = snap.best_ask  # lift the ask to get out
+        else:
+            price = snap.mid - snap.spread * 0.2  # passive buy below mid
         return Signal(
             product=product,
             side=Side.BUY,
-            price=snap.mid - snap.spread * 0.3,
-            volume=2,
-            order_type=OrderType.GTC,
-            reason=f"UNWIND own_ask={own_ask} > own_bid={own_bid}",
+            price=price,
+            volume=vol,
+            order_type=order_type,
+            reason=f"UNWIND pos={pos:+d} vol={vol} {'AGG' if aggressive else 'PASS'}",
         )
-
-    return None
 
 
 # =========================================================================
@@ -662,12 +777,8 @@ def vol_mm_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Signa
     hs = _vmm_state.half_spread()
     vol = _vmm_state.realised_vol()
 
-    # ── Inventory skew (from risk manager positions) ──────────────────────
-    try:
-        positions = bot.get_positions()
-        position = positions.get("LON_ETF", 0) if isinstance(positions, dict) else 0
-    except Exception:
-        position = 0
+    # ── Inventory skew (from cached positions — no API call) ─────────────
+    position = get_position("LON_ETF")
 
     skew = position * _VMM_SKEW_PER_UNIT  # positive pos → push prices down
     adj_mid = mid - skew

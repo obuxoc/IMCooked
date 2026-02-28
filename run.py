@@ -146,7 +146,7 @@ dash.start()  # opens http://localhost:8080
 print("Bot running. Data collection is ALWAYS ON. Press Ctrl+C to stop.\n")
 SAVE_INTERVAL = 120   # save CSVs every 2 minutes
 PNL_CHECK = 30        # check PnL every 30 seconds
-STALE_ORDER_AGE = 60  # cancel resting orders older than 60s
+STALE_ORDER_AGE = 20  # cancel resting orders older than 20s (was 60 — too slow)
 PRINT_INTERVAL = 10   # print state every 10 seconds
 
 last_save = time.time()
@@ -164,6 +164,9 @@ try:
             positions = bot.get_positions()
             if isinstance(positions, dict):
                 risk.update_positions(positions)
+                # Push positions into strategy module for position guards
+                from strategies import update_positions as strat_update_pos
+                strat_update_pos(positions)
         except Exception:
             pass
 
