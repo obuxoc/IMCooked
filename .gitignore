@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+collected_data/
+__MACOSX/
+.ipynb_checkpoints/
+*.egg-info/
+dist/
+build/
+.env

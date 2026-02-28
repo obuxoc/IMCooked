@@ -25,9 +25,11 @@ USAGE (for teammates):
 
 from __future__ import annotations
 
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, fields, asdict
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -358,3 +360,136 @@ class DataCache:
             return pd.DataFrame()
         df = pd.concat(frames, axis=1).sort_index().ffill()
         return df
+
+
+# ---------------------------------------------------------------------------
+# 4. DATA PERSISTENCE — append-only, dedup, single file per product
+# ---------------------------------------------------------------------------
+
+def _safe_csv_append(df: "pd.DataFrame", path: "Path", write_header: bool,
+                     retries: int = 3, delay: float = 0.5) -> bool:
+    """Write df to CSV with retries — handles OneDrive/Windows file locks."""
+    import time as _time
+    for attempt in range(retries):
+        try:
+            df.to_csv(path, mode="a", header=write_header, index=False)
+            return True
+        except PermissionError:
+            if attempt < retries - 1:
+                _time.sleep(delay)
+            else:
+                return False
+    return False
+
+
+class DataPersistence:
+    """Handles saving/loading orderbook data to/from CSV files.
+
+    Design decisions:
+    - ONE file per product (e.g. collected_data/TIDE_SPOT.csv)
+    - ONE file for trades (collected_data/trades.csv)
+    - APPEND mode: new data is appended, never overwritten
+    - DEDUP by timestamp: duplicate timestamps are dropped on save
+    - LOAD on startup: existing CSV data is available immediately
+    """
+
+    def __init__(self, data_dir: str = "collected_data"):
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        # Track last-saved timestamp per product to avoid duplicate writes
+        self._last_saved_ts: dict[str, float] = {}
+        self._last_saved_trade_ts: float = 0.0
+
+    def _product_path(self, product: str) -> Path:
+        return self.data_dir / f"{product}.csv"
+
+    @property
+    def _trade_path(self) -> Path:
+        return self.data_dir / "trades.csv"
+
+    def load_existing(self, product: str) -> pd.DataFrame:
+        """Load existing CSV for a product. Returns empty DataFrame if none."""
+        p = self._product_path(product)
+        if p.exists() and p.stat().st_size > 0:
+            try:
+                df = pd.read_csv(p)
+                if "timestamp" in df.columns and not df.empty:
+                    self._last_saved_ts[product] = df["timestamp"].max()
+                return df
+            except Exception as e:
+                print(f"[PERSIST] Warning: couldn't load {p}: {e}")
+        return pd.DataFrame()
+
+    def load_existing_trades(self) -> pd.DataFrame:
+        """Load existing trade CSV. Returns empty DataFrame if none."""
+        p = self._trade_path
+        if p.exists() and p.stat().st_size > 0:
+            try:
+                df = pd.read_csv(p)
+                if "timestamp" in df.columns and not df.empty:
+                    self._last_saved_trade_ts = df["timestamp"].max()
+                return df
+            except Exception as e:
+                print(f"[PERSIST] Warning: couldn't load {p}: {e}")
+        return pd.DataFrame()
+
+    def save_snapshots(self, cache: DataCache) -> int:
+        """Append new snapshots to per-product CSVs. Returns rows written."""
+        total_written = 0
+        for product in cache.products:
+            df = cache.history(product)
+            if df.empty:
+                continue
+
+            # Filter to only NEW rows (timestamp > last saved)
+            last_ts = self._last_saved_ts.get(product, 0.0)
+            new_rows = df[df["timestamp"] > last_ts]
+            if new_rows.empty:
+                continue
+
+            p = self._product_path(product)
+            write_header = not p.exists() or p.stat().st_size == 0
+
+            if _safe_csv_append(new_rows, p, write_header):
+                self._last_saved_ts[product] = new_rows["timestamp"].max()
+                total_written += len(new_rows)
+            else:
+                print(f"[PERSIST] Skipped {product} (file locked by OneDrive)")
+
+        return total_written
+
+    def save_trades(self, cache: DataCache) -> int:
+        """Append new trades to trades.csv. Returns rows written."""
+        df = cache.trade_history()
+        if df.empty:
+            return 0
+
+        new_rows = df[df["timestamp"] > self._last_saved_trade_ts]
+        if new_rows.empty:
+            return 0
+
+        p = self._trade_path
+        write_header = not p.exists() or p.stat().st_size == 0
+
+        if _safe_csv_append(new_rows, p, write_header):
+            self._last_saved_trade_ts = new_rows["timestamp"].max()
+            return len(new_rows)
+        print("[PERSIST] Skipped trades (file locked by OneDrive)")
+        return 0
+
+    def save_all(self, cache: DataCache) -> tuple[int, int]:
+        """Save both snapshots and trades. Returns (snap_rows, trade_rows)."""
+        s = self.save_snapshots(cache)
+        t = self.save_trades(cache)
+        if s or t:
+            print(f"[PERSIST] Saved {s} snapshot rows + {t} trade rows")
+        return s, t
+
+    def get_full_history(self, product: str) -> pd.DataFrame:
+        """Load full saved CSV history for a product (from disk, not cache)."""
+        return self.load_existing(product)
+
+    def get_all_products_on_disk(self) -> list[str]:
+        """List all products that have saved data."""
+        return [p.stem for p in self.data_dir.glob("*.csv")
+                if p.stem != "trades"]

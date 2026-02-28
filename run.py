@@ -4,6 +4,11 @@ Run this script to start the bot with all strategies.
     python run.py                    # LIVE trading with risk management
     python run.py --collect-only     # data collection mode (no orders)
 
+DATA COLLECTION IS ALWAYS ON:
+    Orderbook snapshots & trades are recorded regardless of mode.
+    CSVs: collected_data/{PRODUCT}.csv and collected_data/trades.csv
+    APPEND-only, no overwrites, no duplicate timestamps.
+
 FLOW:
     Teammate strategy(bot, snap) → Signal | None
     → RiskManager.check(signal)  → approved / rejected
@@ -13,76 +18,154 @@ FLOW:
 import sys
 import time
 import os
+import shutil
 from algothon_bot import AlgothonBot
 from signals import RiskManager, RiskConfig, Executor, make_signal_dispatcher
+from data_cache import DataPersistence
+from dashboard import Dashboard
 
-# Import teammate strategies (they return Signal | None, never trade directly)
-from strategies import mm_strategy, arb_strategy, trade_logger
+# Import all strategies
+from strategies import (
+    grid_strategy,
+    etf_arb_strategy,
+    component_arb_strategy,
+    fly_strategy,
+    mean_revert_strategy,
+    inventory_unwind_strategy,
+    etf_mm_strategy,
+    vol_mm_strategy,
+    trade_logger,
+)
 
 # ── CREDENTIALS ──────────────────────────────────────────────────────────
 TEST_URL = "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
-CHALLENGE_URL = "REPLACE_WITH_CHALLENGE_URL"
+CHALLENGE_URL = "http://ec2-52-19-74-159.eu-west-1.compute.amazonaws.com/"
 
-EXCHANGE_URL = TEST_URL       # Switch to CHALLENGE_URL when competing
-USERNAME = "abcd"       # <── PUT YOUR USERNAME HERE
-PASSWORD = "abcd"   # <── PUT YOUR PASSWORD HERE
+EXCHANGE_URL = CHALLENGE_URL  # ← LIVE CHALLENGE EXCHANGE
+USERNAME = "IMCooked"             # <── PUT YOUR USERNAME HERE
+PASSWORD = "imsocooked"             # <── PUT YOUR PASSWORD HERE
 
-# ── RISK CONFIG (TUNE THESE — this is YOUR domain) ──────────────────────
+# ── RISK CONFIG (MODERATE — tuned for competition) ──────────────────────
 risk_config = RiskConfig(
-    max_position_per_product=50,   # max abs net position per product
-    max_total_exposure=200,        # sum of abs positions across all products
-    max_order_size=20,             # single order volume cap
-    max_orders_per_minute=50,      # stay under exchange 60/min limit
-    max_loss_threshold=-5000.0,    # emergency halt if PnL drops below this
-    cooldown_after_loss=30.0,      # seconds to pause after halt trigger
+    max_position_per_product=80,   # exchange limit is ±100; leave headroom
+    max_total_exposure=350,        # sum of abs positions across all products
+    max_order_size=10,             # moderate single order cap
+    max_orders_per_minute=50,
+    max_loss_threshold=-50000.0,   # wide PnL floor (we're already +1.5M)
+    max_drawdown=-20000.0,         # drawdown halt
+    cooldown_after_loss=30.0,
+    inventory_skew_threshold=30,
+    inventory_hard_limit=60,
+    max_notional_per_order=200_000.0,
 )
 
 # ── MODE ─────────────────────────────────────────────────────────────────
 COLLECT_ONLY = "--collect-only" in sys.argv
+DRY_RUN      = "--dry-run"      in sys.argv
+CLEAR_DATA   = "--clear-data"   in sys.argv
+
+# Dashboard port (default 8080; use --port=8081 for a second instance)
+DASH_PORT = 8080
+for arg in sys.argv:
+    if arg.startswith("--port="):
+        DASH_PORT = int(arg.split("=", 1)[1])
+
+# ── CLEAR OLD DATA ───────────────────────────────────────────────────────
+# Store data OUTSIDE OneDrive to avoid sync locking CSVs mid-write
+data_dir = os.path.expandvars(r"%LOCALAPPDATA%\algothon_data")
+if CLEAR_DATA:
+    if os.path.exists(data_dir):
+        failed = []
+        for f in os.listdir(data_dir):
+            fp = os.path.join(data_dir, f)
+            try:
+                os.remove(fp)
+            except PermissionError:
+                # File locked (OneDrive / another process) – truncate instead
+                try:
+                    open(fp, "w").close()
+                    failed.append(f"{f} (truncated)")
+                except Exception:
+                    failed.append(f"{f} (LOCKED)")
+            except Exception:
+                pass
+        if failed:
+            print(f"[CLEAR] Some files locked: {', '.join(failed)}")
+        else:
+            shutil.rmtree(data_dir, ignore_errors=True)
+            print(f"[CLEAR] Deleted {data_dir}/")
+    else:
+        print("[CLEAR] No data directory to clear")
 
 # ── BOOT ─────────────────────────────────────────────────────────────────
 bot = AlgothonBot(EXCHANGE_URL, USERNAME, PASSWORD)
 risk = RiskManager(risk_config)
-executor = Executor(bot, risk)
+executor = Executor(bot, risk, dry_run=DRY_RUN)
 dispatch = make_signal_dispatcher(executor, risk)
+
+# Data persistence (ALWAYS active)
+persist = DataPersistence(data_dir)
 
 if COLLECT_ONLY:
     print("=" * 60)
     print("  DATA COLLECTION MODE — no orders will be sent")
+    print("  Snapshots + trades will be saved to collected_data/")
     print("=" * 60)
 else:
-    # Wrap each teammate strategy with risk + execution
-    bot.register_orderbook_strategy(dispatch(mm_strategy))
-    bot.register_orderbook_strategy(dispatch(arb_strategy))
+    # Register ALL strategies with risk + execution dispatch
+    # (works for both --dry-run and live — Executor handles the difference)
+    bot.register_orderbook_strategy(dispatch(grid_strategy))
+    bot.register_orderbook_strategy(dispatch(etf_arb_strategy))
+    bot.register_orderbook_strategy(dispatch(component_arb_strategy))
+    bot.register_orderbook_strategy(dispatch(fly_strategy))
+    # bot.register_orderbook_strategy(dispatch(mean_revert_strategy))   # disabled: net loser in backtest
+    bot.register_orderbook_strategy(dispatch(inventory_unwind_strategy))
+    # bot.register_orderbook_strategy(dispatch(etf_mm_strategy))        # disabled: net loser, overlaps vol_mm
+    bot.register_orderbook_strategy(dispatch(vol_mm_strategy))
     bot.register_trade_strategy(trade_logger)
-    print(f"[RISK] Limits: pos={risk_config.max_position_per_product}, "
+    print(f"[RISK] pos={risk_config.max_position_per_product}, "
           f"exposure={risk_config.max_total_exposure}, "
           f"order_size={risk_config.max_order_size}, "
-          f"loss_halt={risk_config.max_loss_threshold}")
+          f"loss_halt={risk_config.max_loss_threshold}, "
+          f"drawdown_halt={risk_config.max_drawdown}")
+
+    if DRY_RUN:
+        print("=" * 60)
+        print("  DRY-RUN MODE — strategies run, orders LOGGED not sent")
+        print("  Watch [DRY-RUN] lines to verify strategy behaviour")
+        print("=" * 60)
 
 bot.start()
 
+# ── DASHBOARD ────────────────────────────────────────────────────────────
+dash = Dashboard(bot, risk, executor, persist, port=DASH_PORT,
+                 simulator=executor.simulator)
+dash.start()  # opens http://localhost:8080
+
 # ── MAIN LOOP ────────────────────────────────────────────────────────────
-print("Bot running. Press Ctrl+C to stop.\n")
-SAVE_INTERVAL = 300   # save CSVs every 5 minutes
+print("Bot running. Data collection is ALWAYS ON. Press Ctrl+C to stop.\n")
+SAVE_INTERVAL = 120   # save CSVs every 2 minutes
 PNL_CHECK = 30        # check PnL every 30 seconds
 STALE_ORDER_AGE = 60  # cancel resting orders older than 60s
+PRINT_INTERVAL = 10   # print state every 10 seconds
+
 last_save = time.time()
 last_pnl_check = time.time()
 last_stale_check = time.time()
 
 try:
     while True:
-        time.sleep(10)
+        time.sleep(PRINT_INTERVAL)
         bot.print_state()
         now = time.time()
 
-        # ── Sync positions from exchange ──
-        if not COLLECT_ONLY:
-            try:
-                risk.update_positions(bot.get_positions())
-            except Exception:
-                pass
+        # ── Sync positions from exchange (always, for risk tracking) ──
+        try:
+            positions = bot.get_positions()
+            if isinstance(positions, dict):
+                risk.update_positions(positions)
+        except Exception:
+            pass
 
         # ── PnL watchdog ──
         if not COLLECT_ONLY and now - last_pnl_check > PNL_CHECK:
@@ -100,33 +183,22 @@ try:
         if not COLLECT_ONLY:
             risk.print_stats()
 
-        # ── Auto-save data to CSV ──
+        # ── Simulator mark-to-market + summary (all modes) ──
+        if executor.simulator:
+            executor.simulator.mark_to_market(bot.cache.mids)
+            executor.simulator.print_summary()
+
+        # ── Auto-save data (ALWAYS — both modes) ──
         if now - last_save > SAVE_INTERVAL:
-            save_dir = os.path.join(os.path.dirname(__file__), "collected_data")
-            os.makedirs(save_dir, exist_ok=True)
-            for product in bot.cache.products:
-                df = bot.history(product)
-                if not df.empty:
-                    df.to_csv(os.path.join(save_dir, f"{product}.csv"), index=False)
-            trades = bot.trade_history()
-            if not trades.empty:
-                trades.to_csv(os.path.join(save_dir, "trades.csv"), index=False)
-            print(f"[SAVE] Data saved to {save_dir}/")
+            persist.save_all(bot.cache)
             last_save = now
 
 except KeyboardInterrupt:
     print("\nShutting down...")
+
     # Final save
-    save_dir = os.path.join(os.path.dirname(__file__), "collected_data")
-    os.makedirs(save_dir, exist_ok=True)
-    for product in bot.cache.products:
-        df = bot.history(product)
-        if not df.empty:
-            df.to_csv(os.path.join(save_dir, f"{product}.csv"), index=False)
-    trades = bot.trade_history()
-    if not trades.empty:
-        trades.to_csv(os.path.join(save_dir, "trades.csv"), index=False)
-    print(f"[SAVE] Final data saved to {save_dir}/")
+    snap_rows, trade_rows = persist.save_all(bot.cache)
+    print(f"[PERSIST] Final save: {snap_rows} snapshot rows + {trade_rows} trade rows")
 
     if not COLLECT_ONLY:
         risk.print_stats()
