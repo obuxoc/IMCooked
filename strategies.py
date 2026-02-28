@@ -90,6 +90,28 @@ def _position_guard(product: str, side: Side) -> bool:
 
 
 # =========================================================================
+# ALPHA ENGINE INTEGRATION
+# =========================================================================
+# Alpha computes settlement fair values from real-world data (weather, tides).
+# Injected by run.py at startup via set_alpha().
+
+_alpha = None  # AlphaEngine instance
+
+
+def set_alpha(alpha) -> None:
+    """Called by run.py to inject the AlphaEngine."""
+    global _alpha
+    _alpha = alpha
+
+
+def _alpha_fair(product: str) -> tuple[float, float]:
+    """Get (fair_value, confidence) from alpha. (NaN, 0) if unavailable."""
+    if _alpha is None:
+        return float("nan"), 0.0
+    return _alpha.get(product)
+
+
+# =========================================================================
 # PRICE HISTORY TRACKER (shared state for all strategies)
 # =========================================================================
 
@@ -209,7 +231,15 @@ def grid_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Signal]
     if _tracker.tick_count(product) < 10:
         return None
 
-    center = _tracker.ema_slow(product) if cfg["center_ema"] else snap.mid
+    # ── Center on alpha fair value when available, blend with EMA ──
+    alpha_fv, alpha_cf = _alpha_fair(product)
+    ema = _tracker.ema_slow(product) if cfg["center_ema"] else snap.mid
+    if not math.isnan(alpha_fv) and alpha_cf > 0.3 and not math.isnan(ema):
+        center = alpha_cf * alpha_fv + (1 - alpha_cf) * ema
+    elif not math.isnan(alpha_fv) and alpha_cf > 0.5:
+        center = alpha_fv
+    else:
+        center = ema
     if math.isnan(center) or center <= 0:
         return None
 
@@ -285,7 +315,13 @@ def etf_arb_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Sign
     if now - _arb_last_trade < ARB_MIN_INTERVAL:
         return None
 
-    gap = bot.etf_arb_gap
+    # ── Use alpha fair ETF when available (better than market-derived fair) ──
+    alpha_etf, alpha_etf_cf = _alpha_fair("LON_ETF")
+    etf_mid = bot.mids.get("LON_ETF", float("nan"))
+    if not math.isnan(alpha_etf) and alpha_etf_cf > 0.3 and not math.isnan(etf_mid):
+        gap = etf_mid - alpha_etf
+    else:
+        gap = bot.etf_arb_gap
     if math.isnan(gap):
         return None
 
@@ -451,7 +487,12 @@ def fly_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Signal]:
     if math.isnan(etf_ema) or etf_ema <= 0:
         return None
 
-    fair_fly = compute_fly_fair(etf_ema)
+    # ── Use alpha fair ETF for better FLY valuation ──
+    alpha_etf, alpha_etf_cf = _alpha_fair("LON_ETF")
+    if not math.isnan(alpha_etf) and alpha_etf_cf > 0.3:
+        fair_fly = compute_fly_fair(alpha_etf)
+    else:
+        fair_fly = compute_fly_fair(etf_ema)
     gap = snap.mid - fair_fly
 
     if abs(gap) < FLY_THRESHOLD:
@@ -487,64 +528,98 @@ def fly_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Signal]:
 
 
 # =========================================================================
-# STRATEGY 5: MEAN REVERSION (for high-vol products)
+# STRATEGY 5: ALPHA DIRECTIONAL (data-driven fair value trading)
 # =========================================================================
+# THE KEY STRATEGY: trade towards settlement fair values computed from
+# real-world data (weather, tides). This is the competition's primary edge.
+# Products will settle at known formulas — if our estimate > market, BUY.
 
-MR_PRODUCTS = {"LHR_COUNT", "TIDE_SPOT", "LON_ETF"}
-MR_THRESHOLD_SIGMAS = 1.5
-MR_INTERVAL = 3.0
-_mr_last: dict[str, float] = {}
+ALPHA_MIN_EDGE_PCT = 0.015   # 1.5% min divergence to trade
+ALPHA_INTERVAL = 4.0          # seconds between signals per product
+ALPHA_MAX_POS = 50            # max position from alpha (scaled by confidence)
+_alpha_last: dict[str, float] = {}
 
 
-def mean_revert_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Signal]:
-    """Mean reversion — buy when far below EMA, sell when far above."""
+def alpha_directional(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Signal]:
+    """Trade towards alpha fair values when market diverges significantly.
+
+    For every product with an alpha fair value and sufficient confidence,
+    if market deviates > MIN_EDGE from fair → IOC towards fair value.
+    Position size scales with confidence and edge magnitude.
+    """
     _update_tracker(snap)
 
     product = snap.product
-    if product not in MR_PRODUCTS:
+    fair, conf = _alpha_fair(product)
+
+    if math.isnan(fair) or conf < 0.25:
         return None
 
     now = time.time()
-    if now - _mr_last.get(product, 0) < MR_INTERVAL:
+    if now - _alpha_last.get(product, 0) < ALPHA_INTERVAL:
         return None
 
-    if _tracker.tick_count(product) < 30:
+    mid = snap.mid
+    if math.isnan(mid) or mid <= 0:
         return None
 
-    if math.isnan(snap.mid):
+    # Edge: how far market is from our fair value
+    edge = (fair - mid) / mid  # positive = market cheap → buy
+
+    # Minimum edge threshold (inversely scaled by confidence)
+    min_edge = ALPHA_MIN_EDGE_PCT / max(0.3, conf)
+    if abs(edge) < min_edge:
         return None
 
-    ema = _tracker.ema_slow(product)
-    vol = _tracker.volatility(product)
+    # Max position based on confidence
+    max_pos = int(ALPHA_MAX_POS * conf)
+    pos = get_position(product)
 
-    if math.isnan(ema) or vol <= 0:
-        return None
+    _alpha_last[product] = now
 
-    z_score = (snap.mid - ema) / (ema * vol) if ema * vol > 0 else 0.0
-
-    if abs(z_score) < MR_THRESHOLD_SIGMAS:
-        return None
-
-    _mr_last[product] = now
-
-    if z_score > MR_THRESHOLD_SIGMAS:
-        return Signal(
-            product=product,
-            side=Side.SELL,
-            price=snap.best_bid,
-            volume=2,
-            order_type=OrderType.GTC,
-            reason=f"MEANREV z={z_score:.1f} SELL (ema={ema:.0f})",
-        )
-    else:
+    if edge > 0:  # market cheap → BUY towards fair
+        if pos >= max_pos:
+            return None
+        if _position_guard(product, Side.BUY):
+            return None
+        # Scale volume: bigger edge → more aggressive
+        vol = min(5, max(1, int(abs(edge) * 100)))
+        vol = min(vol, max_pos - pos)  # don't exceed max_pos
+        if vol <= 0:
+            return None
         return Signal(
             product=product,
             side=Side.BUY,
             price=snap.best_ask,
-            volume=2,
-            order_type=OrderType.GTC,
-            reason=f"MEANREV z={z_score:.1f} BUY (ema={ema:.0f})",
+            volume=vol,
+            order_type=OrderType.IOC,
+            reason=f"ALPHA {product} fair={fair:.0f} mid={mid:.0f} edge={edge:+.1%} conf={conf:.0%}",
+            urgency=min(1.0, abs(edge) * 10),
         )
+    else:  # market rich → SELL towards fair
+        if pos <= -max_pos:
+            return None
+        if _position_guard(product, Side.SELL):
+            return None
+        vol = min(5, max(1, int(abs(edge) * 100)))
+        vol = min(vol, max_pos + pos)  # don't exceed -max_pos
+        if vol <= 0:
+            return None
+        return Signal(
+            product=product,
+            side=Side.SELL,
+            price=snap.best_bid,
+            volume=vol,
+            order_type=OrderType.IOC,
+            reason=f"ALPHA {product} fair={fair:.0f} mid={mid:.0f} edge={edge:+.1%} conf={conf:.0%}",
+            urgency=min(1.0, abs(edge) * 10),
+        )
+
+
+# ── DISABLED: mean_revert_strategy (net loser, replaced by alpha) ──
+def mean_revert_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Signal]:
+    _update_tracker(snap)
+    return None
 
 
 # =========================================================================
@@ -619,51 +694,10 @@ def inventory_unwind_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Opti
         )
 
 
-# =========================================================================
-# STRATEGY 7: ETF MARKET MAKING
-# =========================================================================
-
-ETF_MM_WIDTH = 15.0
-ETF_MM_INTERVAL = 3.0
-_etf_mm_last: float = 0.0
-
-
+# ── DISABLED: etf_mm_strategy (net loser, overlaps vol_mm) ──
 def etf_mm_strategy(bot: AlgothonBot, snap: OrderBookSnapshot) -> Optional[Signal]:
-    """Market make LON_ETF with quotes anchored to component-implied fair value."""
-    global _etf_mm_last
-
     _update_tracker(snap)
-
-    if snap.product != "LON_ETF":
-        return None
-
-    now = time.time()
-    if now - _etf_mm_last < ETF_MM_INTERVAL:
-        return None
-
-    fair = bot.fair_etf
-    if math.isnan(fair):
-        return None
-
-    skew = snap.imbalance * 5.0
-    bid = fair - ETF_MM_WIDTH + skew
-    ask = fair + ETF_MM_WIDTH + skew
-
-    if bid <= 0 or bid >= ask:
-        return None
-
-    _etf_mm_last = now
-
-    return Signal(
-        product="LON_ETF",
-        side=Side.BUY,
-        price=bid,
-        volume=2,
-        order_type=OrderType.QUOTE,
-        ask_price=ask,
-        ask_volume=2,
-        reason=f"ETF_MM fair={fair:.0f} skew={skew:+.1f}",
-    )
+    return None
 
 
 # =========================================================================

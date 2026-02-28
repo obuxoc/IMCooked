@@ -38,6 +38,7 @@ _risk: RiskManager | None = None
 _executor: Executor | None = None
 _persist: DataPersistence | None = None
 _simulator = None  # DryRunSimulator when in dry-run mode
+_alpha = None      # AlphaEngine for fair value display
 # Rolling history for charts (stored server-side, sent to frontend)
 _price_history: dict[str, deque] = {}       # product -> deque of {t, mid, bid, ask}
 _arb_history: deque = deque(maxlen=500)      # deque of {t, gap, fair, etf_mid}
@@ -238,6 +239,14 @@ class _DashHandler(BaseHTTPRequestHandler):
                 "ema_slow": _safe(ema_slow),
                 "trend": round(trend * 10000, 1) if isinstance(trend, float) else 0,
             }
+            # Alpha fair values
+            if _alpha:
+                afv, acf = _alpha.get(sym)
+                entry["alpha_fair"] = _safe(afv)
+                entry["alpha_conf"] = round(acf * 100, 1) if acf else 0
+            else:
+                entry["alpha_fair"] = None
+                entry["alpha_conf"] = 0
             state["products"].append(entry)
 
             # Order book depth (top 5 levels each side)
@@ -332,6 +341,17 @@ class _DashHandler(BaseHTTPRequestHandler):
         state["trade_volume"] = dict(_trade_volume)
         state["trade_count"] = dict(_trade_count)
 
+        # Alpha fair values summary
+        if _alpha and _alpha.fair:
+            state["alpha"] = {
+                "fair": {k: _safe(v) for k, v in _alpha.fair.items()},
+                "confidence": {k: round(v * 100, 1) for k, v in _alpha.confidence.items()},
+                "hours_left": round(_alpha._hours_left(), 2),
+                "last_update": round(_alpha.last_update, 1) if _alpha.last_update else None,
+            }
+        else:
+            state["alpha"] = None
+
         return state
 
 
@@ -344,13 +364,15 @@ def _safe(v):
 
 
 class Dashboard:
-    def __init__(self, bot, risk, executor, persist=None, port: int = 8080,   simulator=None):
-        global _bot, _risk, _executor, _persist, _simulator
+    def __init__(self, bot, risk, executor, persist=None, port: int = 8080,
+                 simulator=None, alpha=None):
+        global _bot, _risk, _executor, _persist, _simulator, _alpha
         _bot = bot
         _risk = risk
         _executor = executor
         _persist = persist
         _simulator = simulator
+        _alpha = alpha
         self.port = port
         self._server: HTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -456,12 +478,19 @@ _HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 </div>
 
+<!-- ═══ ROW 2a: Alpha Fair Values ═══ -->
+<div id="alpha-section" style="display:none">
+<h2>Alpha Fair Values <span class="dim" style="font-size:11px">(real-world data → settlement estimates)</span></h2>
+<div class="g-auto" id="alpha-cards"></div>
+</div>
+
 <!-- ═══ ROW 3: Products table + Positions ═══ -->
 <h2>Markets & Positions</h2>
 <div class="card" style="overflow-x:auto">
   <table id="products-table">
     <thead><tr>
       <th>Product</th><th>Bid</th><th>Ask</th><th>Spread</th><th>Mid</th>
+      <th>Fair</th><th>Conf</th>
       <th>EMA-F</th><th>EMA-S</th><th>Vol (bps)</th><th>Trend</th>
       <th>Imbalance</th><th>Position</th>
     </tr></thead>
@@ -770,7 +799,38 @@ function render(state){
   // -- Simulated PnL (dry-run) --
   renderSimulator(state.simulator);
 
-  // -- Products table --
+  // -- Alpha fair values --
+  const alpha=state.alpha;
+  const alphaSection=$('#alpha-section');
+  if(alpha && alpha.fair && Object.keys(alpha.fair).length){
+    alphaSection.style.display='block';
+    const fairs=alpha.fair;
+    const confs=alpha.confidence||{};
+    let aHtml=`<div class="card-sm" style="min-width:180px">
+      <div class="dim">Settlement In</div>
+      <div class="big blue">${fmt(alpha.hours_left,1)}h</div>
+      <div class="dim" style="font-size:11px">Last update: ${alpha.last_update?new Date(alpha.last_update*1000).toLocaleTimeString():'—'}</div>
+    </div>`;
+    const products=state.products||[];
+    Object.entries(fairs).sort().forEach(([prod,fair])=>{
+      if(fair==null)return;
+      const conf=confs[prod]||0;
+      const mp=products.find(p=>p.product===prod);
+      const mid=mp?mp.mid:null;
+      const edge=mid&&fair?((fair-mid)/mid*100):null;
+      const edgeStr=edge!=null?`${edge>=0?'+':''}${edge.toFixed(1)}%`:'—';
+      aHtml+=`<div class="card-sm">
+        <div style="display:flex;justify-content:space-between"><strong class="white">${prod}</strong><span class="dim">${conf.toFixed(0)}% conf</span></div>
+        <div class="metric-row"><span class="metric-label">Fair</span><span class="blue">${fmt(fair,0)}</span></div>
+        <div class="metric-row"><span class="metric-label">Market</span><span>${mid!=null?fmt(mid,0):'—'}</span></div>
+        <div class="metric-row"><span class="metric-label">Edge</span><span class="${edge>=0?'green':'red'}">${edgeStr}</span></div>
+        <div class="bar-bg"><div class="bar-fg" style="width:${conf}%;background:#58a6ff"></div></div>
+      </div>`;
+    });
+    $('#alpha-cards').innerHTML=aHtml;
+  } else { alphaSection.style.display='none'; }
+
+  // -- Products table (with alpha columns) --
   const tbody=$('#products-table tbody');
   tbody.innerHTML=(state.products||[]).map(p=>`
     <tr>
@@ -779,6 +839,8 @@ function render(state){
       <td class="red">${fmt(p.best_ask,0)}</td>
       <td>${fmt(p.spread,1)}</td>
       <td class="white">${fmt(p.mid,1)}</td>
+      <td class="blue">${p.alpha_fair!=null?fmt(p.alpha_fair,0):'—'}</td>
+      <td class="dim">${p.alpha_conf?p.alpha_conf+'%':'—'}</td>
       <td class="blue">${fmt(p.ema_fast,1)}</td>
       <td>${fmt(p.ema_slow,1)}</td>
       <td class="yellow">${fmt(p.volatility,1)}</td>

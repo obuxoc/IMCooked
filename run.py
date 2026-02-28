@@ -35,7 +35,10 @@ from strategies import (
     etf_mm_strategy,
     vol_mm_strategy,
     trade_logger,
+    alpha_directional,
+    set_alpha,
 )
+from alpha import AlphaEngine
 
 # ── CREDENTIALS ──────────────────────────────────────────────────────────
 TEST_URL = "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
@@ -106,6 +109,17 @@ dispatch = make_signal_dispatcher(executor, risk)
 # Data persistence (ALWAYS active)
 persist = DataPersistence(data_dir)
 
+# ── ALPHA ENGINE ─────────────────────────────────────────────────────────
+# Computes settlement fair values from real-world data (weather, tides).
+# This is the #1 competitive edge: products settle based on observable data.
+alpha = AlphaEngine()
+set_alpha(alpha)
+try:
+    alpha.refresh()  # initial fetch
+    print(alpha.summary())
+except Exception as e:
+    print(f"[ALPHA] Initial fetch failed (will retry): {e}")
+
 if COLLECT_ONLY:
     print("=" * 60)
     print("  DATA COLLECTION MODE — no orders will be sent")
@@ -114,11 +128,12 @@ if COLLECT_ONLY:
 else:
     # Register ALL strategies with risk + execution dispatch
     # (works for both --dry-run and live — Executor handles the difference)
+    bot.register_orderbook_strategy(dispatch(alpha_directional))   # #1 PRIORITY: data-driven
     bot.register_orderbook_strategy(dispatch(grid_strategy))
     bot.register_orderbook_strategy(dispatch(etf_arb_strategy))
     bot.register_orderbook_strategy(dispatch(component_arb_strategy))
     bot.register_orderbook_strategy(dispatch(fly_strategy))
-    # bot.register_orderbook_strategy(dispatch(mean_revert_strategy))   # disabled: net loser in backtest
+    # bot.register_orderbook_strategy(dispatch(mean_revert_strategy))   # disabled: replaced by alpha
     bot.register_orderbook_strategy(dispatch(inventory_unwind_strategy))
     # bot.register_orderbook_strategy(dispatch(etf_mm_strategy))        # disabled: net loser, overlaps vol_mm
     bot.register_orderbook_strategy(dispatch(vol_mm_strategy))
@@ -139,7 +154,7 @@ bot.start()
 
 # ── DASHBOARD ────────────────────────────────────────────────────────────
 dash = Dashboard(bot, risk, executor, persist, port=DASH_PORT,
-                 simulator=executor.simulator)
+                 simulator=executor.simulator, alpha=alpha)
 dash.start()  # opens http://localhost:8080
 
 # ── MAIN LOOP ────────────────────────────────────────────────────────────
@@ -148,10 +163,12 @@ SAVE_INTERVAL = 120   # save CSVs every 2 minutes
 PNL_CHECK = 30        # check PnL every 30 seconds
 STALE_ORDER_AGE = 20  # cancel resting orders older than 20s (was 60 — too slow)
 PRINT_INTERVAL = 10   # print state every 10 seconds
+ALPHA_INTERVAL = 60   # refresh alpha fair values every 60s
 
 last_save = time.time()
 last_pnl_check = time.time()
 last_stale_check = time.time()
+last_alpha_refresh = time.time()
 
 try:
     while True:
@@ -169,6 +186,14 @@ try:
                 strat_update_pos(positions)
         except Exception:
             pass
+
+        # ── Refresh alpha fair values ──
+        if now - last_alpha_refresh > ALPHA_INTERVAL:
+            try:
+                alpha.refresh(bot.mids)
+            except Exception as e:
+                print(f"[ALPHA] Refresh error: {e}")
+            last_alpha_refresh = now
 
         # ── PnL watchdog ──
         if not COLLECT_ONLY and now - last_pnl_check > PNL_CHECK:
