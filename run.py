@@ -22,7 +22,7 @@ import shutil
 from algothon_bot import AlgothonBot
 from signals import RiskManager, RiskConfig, Executor, make_signal_dispatcher
 from data_cache import DataPersistence
-from dashboard import Dashboard
+from dashboard import Dashboard, push_pnl
 
 # Import all strategies
 from strategies import (
@@ -198,6 +198,11 @@ try:
         # ── PnL watchdog ──
         if not COLLECT_ONLY and now - last_pnl_check > PNL_CHECK:
             risk.check_pnl(bot)
+            # Push PnL to dashboard (no extra API call — reuse risk's value)
+            try:
+                push_pnl(risk._current_pnl)
+            except Exception:
+                pass
             last_pnl_check = now
 
         # ── Cancel stale orders ──

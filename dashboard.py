@@ -1,19 +1,21 @@
-"""Algothon 2026 — Live Dashboard (Full-Featured).
+"""Algothon 2026 -- Competition Dashboard v2.
 
-Lightweight HTTP dashboard with:
-  - PnL chart (live from API)
-  - Price charts for all markets over time
-  - Order book visualization with depth levels
-  - Positions and exposure
-  - ETF arb gap tracking
-  - Volatility metrics per product
-  - Signal approval/rejection stats
-  - Risk state
+Rebuilt from scratch for maximum competitive decision-making.
 
-Usage:
-    from dashboard import Dashboard
-    dash = Dashboard(bot, risk, executor, persist, port=8080)
-    dash.start()  # opens http://localhost:8080
+WHAT A TRADER NEEDS AT A GLANCE:
+  1. PnL: total + per-product + trend
+  2. Alpha edge: fair vs market, what is mispriced RIGHT NOW
+  3. Positions: how close to limits, risk capacity
+  4. Arbitrage: ETF gap, FLY gap (the money-makers)
+  5. Risk: halted? rejection rate? signals throughput
+  6. Price charts: clean, with fair value overlay
+  7. Recent fills: what just happened
+
+FIXED from v1:
+  - NO API calls in recorder thread (was violating rate limit!)
+  - PnL from API is pushed by run.py, not polled here
+  - Full history uses vectorised pandas, not iterrows()
+  - Clean single-purpose sections, no duplication
 """
 
 from __future__ import annotations
@@ -31,37 +33,40 @@ if TYPE_CHECKING:
     from signals import RiskManager, Executor
     from data_cache import DataPersistence
 
-
-# ── GLOBAL STATE ─────────────────────────────────────────────────────────
+# -- Global refs (set by Dashboard.__init__) --
 _bot: AlgothonBot | None = None
 _risk: RiskManager | None = None
 _executor: Executor | None = None
 _persist: DataPersistence | None = None
-_simulator = None  # DryRunSimulator when in dry-run mode
-_alpha = None      # AlphaEngine for fair value display
-# Rolling history for charts (stored server-side, sent to frontend)
-_price_history: dict[str, deque] = {}       # product -> deque of {t, mid, bid, ask}
-_arb_history: deque = deque(maxlen=500)      # deque of {t, gap, fair, etf_mid}
-_pnl_from_api: deque = deque(maxlen=500)     # deque of {t, pnl}
-_MAX_CHART_POINTS = 300
+_simulator = None
+_alpha = None
 
-# Trade volume tracking — cumulative volume per product from trade stream
-_trade_volume: dict[str, int] = {}           # product -> cumulative traded volume
-_trade_count: dict[str, int] = {}            # product -> cumulative trade count
-_last_trade_idx: int = 0                     # how many trades we've already counted
+# -- Rolling chart data --
+_price_history: dict[str, deque] = {}
+_arb_history: deque = deque(maxlen=500)
+_pnl_history: deque = deque(maxlen=500)
+_MAX_PTS = 300
+
+# -- Trade tracking --
+_trade_volume: dict[str, int] = {}
+_trade_count: dict[str, int] = {}
+_last_trade_idx: int = 0
+
+
+def push_pnl(pnl_value: float) -> None:
+    """Called by run.py when it fetches PnL -- avoids extra API calls."""
+    _pnl_history.append({"t": time.time(), "pnl": round(float(pnl_value), 2)})
 
 
 def _record_tick():
-    """Called periodically to snapshot prices & PnL into chart histories."""
+    """Snapshot prices for charts. NO API calls here (rate-limit safe)."""
     if _bot is None:
         return
-
     now = time.time()
 
-    # Price history per product
     for sym, snap in _bot.latest.items():
         if sym not in _price_history:
-            _price_history[sym] = deque(maxlen=_MAX_CHART_POINTS)
+            _price_history[sym] = deque(maxlen=_MAX_PTS)
         if not math.isnan(snap.mid):
             _price_history[sym].append({
                 "t": now,
@@ -70,35 +75,28 @@ def _record_tick():
                 "ask": round(snap.best_ask, 1) if not math.isnan(snap.best_ask) else None,
             })
 
-    # Arb gap history
+    # Arb gap
     try:
         arb = _bot.cache.arb_snapshot()
         gap = arb["gap"]
         if not math.isnan(gap):
-            _arb_history.append({"t": now, "gap": round(gap, 1),
-                                  "fair": round(arb["fair_etf"], 1),
-                                  "etf_mid": round(arb["etf_mid"], 1)})
+            _arb_history.append({
+                "t": now,
+                "gap": round(gap, 1),
+                "fair": round(arb["fair_etf"], 1),
+                "etf_mid": round(arb["etf_mid"], 1),
+            })
     except Exception:
         pass
 
-    # PnL from API
-    if _bot:
-        try:
-            pnl_data = _bot.get_pnl()
-            total = pnl_data.get("totalPnL", pnl_data.get("total", None))
-            if total is not None:
-                _pnl_from_api.append({"t": now, "pnl": round(float(total), 2)})
-        except Exception:
-            pass
-
-    # Mark-to-market dry-run simulator
+    # Simulator MtM (no API)
     if _simulator and _bot:
         try:
             _simulator.mark_to_market(_bot.cache.mids)
         except Exception:
             pass
 
-    # Trade volume tracking — count new trades from cache
+    # Trade volume counting
     global _last_trade_idx
     if _bot:
         try:
@@ -114,7 +112,6 @@ def _record_tick():
 
 
 class _Recorder(threading.Thread):
-    """Background thread that snapshots data for charts every N seconds."""
     def __init__(self, interval: float = 3.0):
         super().__init__(daemon=True)
         self.interval = interval
@@ -132,92 +129,115 @@ class _Recorder(threading.Thread):
         self._stop.set()
 
 
-class _DashHandler(BaseHTTPRequestHandler):
+def _safe(v):
+    if v is None:
+        return None
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return None
+    if isinstance(v, float):
+        return round(v, 2)
+    return v
+
+
+class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
     def do_GET(self):
         if self.path == "/api/state":
-            self._serve_json(self._collect_state())
+            self._json(self._state())
         elif self.path == "/api/history":
-            self._serve_json(self._collect_full_history())
+            self._json(self._history())
         else:
-            self._serve_html()
+            self._html()
 
-    def _serve_json(self, data):
-        body = json.dumps(data).encode()
+    def _json(self, data):
+        body = json.dumps(data, default=str).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 
-    def _serve_html(self):
+    def _html(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.end_headers()
-        self.wfile.write(_HTML_PAGE.encode())
+        self.wfile.write(_HTML.encode())
 
-    def _collect_full_history(self) -> dict:
-        """Load ALL historical data from CSV files on disk."""
-        import pandas as pd
+    def _history(self) -> dict:
+        """Full CSV history -- vectorised, fast."""
         result: dict = {"price_history": {}, "trade_history": []}
         if not _persist:
             return result
         try:
+            import pandas as pd
             for product in _persist.get_all_products_on_disk():
                 df = _persist.load_existing(product)
                 if df.empty or "timestamp" not in df.columns:
                     continue
                 df = df.sort_values("timestamp")
-                points = []
-                for _, row in df.iterrows():
-                    pt = {"t": float(row["timestamp"]),
-                          "mid": round(float(row["mid"]), 1) if "mid" in row and not (isinstance(row["mid"], float) and math.isnan(row["mid"])) else None}
-                    if "best_bid" in row:
-                        v = row["best_bid"]
-                        pt["bid"] = round(float(v), 1) if not (isinstance(v, float) and math.isnan(v)) else None
-                    if "best_ask" in row:
-                        v = row["best_ask"]
-                        pt["ask"] = round(float(v), 1) if not (isinstance(v, float) and math.isnan(v)) else None
-                    points.append(pt)
-                result["price_history"][product] = points
-            # Trade history
-            tdf = _persist.load_existing_trades()
-            if not tdf.empty:
-                tdf = tdf.sort_values("timestamp")
-                trades = []
-                for _, row in tdf.iterrows():
-                    trades.append({
-                        "t": float(row["timestamp"]),
-                        "product": str(row.get("product", "")),
-                        "price": float(row.get("price", 0)),
-                        "volume": float(row.get("volume", 0)),
-                        "buyer": str(row.get("buyer", "")) if not (isinstance(row.get("buyer"), float) and math.isnan(row.get("buyer"))) else "",
-                        "seller": str(row.get("seller", "")) if not (isinstance(row.get("seller"), float) and math.isnan(row.get("seller"))) else "",
-                    })
-                result["trade_history"] = trades
+                cols = ["timestamp"]
+                for c in ["mid", "best_bid", "best_ask"]:
+                    if c in df.columns:
+                        cols.append(c)
+                sub = df[cols].copy()
+                col_map = {"timestamp": "t", "mid": "mid",
+                           "best_bid": "bid", "best_ask": "ask"}
+                sub.columns = [col_map[c] for c in cols]
+                for c in sub.columns[1:]:
+                    sub[c] = sub[c].round(1)
+                sub = sub.where(pd.notnull(sub), None)
+                result["price_history"][product] = sub.to_dict("records")
         except Exception as e:
             result["error"] = str(e)
         return result
 
-    def _collect_state(self) -> dict:
-        state: dict = {"time": time.time(), "products": [], "orderbooks": {}}
-
+    def _state(self) -> dict:
+        s: dict = {"time": time.time(), "products": [], "orderbooks": {}}
         if _bot is None:
-            return state
+            return s
 
-        # --- Per-product live data ---
+        # Pre-fetch shared data
+        tracker = None
+        get_position = None
+        compute_fly_fair_fn = None
+        try:
+            from strategies import (get_tracker, get_position as _gp,
+                                    compute_fly_fair as _cff)
+            tracker = get_tracker()
+            get_position = _gp
+            compute_fly_fair_fn = _cff
+        except Exception:
+            pass
+
+        # -- Products --
         for sym, snap in _bot.latest.items():
-            vol_val = 0.0
-            try:
-                from strategies import get_tracker
-                vol_val = get_tracker().volatility(sym)
-                ema_fast = get_tracker().ema_fast(sym)
-                ema_slow = get_tracker().ema_slow(sym)
-                trend = get_tracker().trend(sym)
-            except Exception:
-                ema_fast = ema_slow = trend = 0.0
+            vol_val = ema_fast = ema_slow = trend = 0.0
+            if tracker:
+                try:
+                    vol_val = tracker.volatility(sym)
+                    ema_fast = tracker.ema_fast(sym)
+                    ema_slow = tracker.ema_slow(sym)
+                    trend = tracker.trend(sym)
+                except Exception:
+                    pass
+
+            pos = 0
+            if get_position:
+                try:
+                    pos = get_position(sym)
+                except Exception:
+                    pass
+
+            alpha_fair = alpha_conf = None
+            if _alpha:
+                try:
+                    afv, acf = _alpha.get(sym)
+                    alpha_fair = _safe(afv)
+                    alpha_conf = round(acf * 100, 1) if acf else 0
+                except Exception:
+                    pass
 
             entry = {
                 "product": sym,
@@ -226,49 +246,32 @@ class _DashHandler(BaseHTTPRequestHandler):
                 "best_ask": _safe(snap.best_ask),
                 "spread": _safe(snap.spread),
                 "imbalance": round(snap.imbalance, 3),
-                "top_imbalance": round(snap.top_imbalance, 3),
-                "micro_price": _safe(snap.micro_price),
-                "weighted_mid": _safe(snap.weighted_mid),
                 "bid_vol": snap.total_bid_vol,
                 "ask_vol": snap.total_ask_vol,
-                "bid_levels": snap.bid_levels,
-                "ask_levels": snap.ask_levels,
-                "position": 0,
-                "volatility": round(vol_val * 10000, 2),  # in bps
+                "position": pos,
+                "volatility": round(vol_val * 10000, 2),
                 "ema_fast": _safe(ema_fast),
                 "ema_slow": _safe(ema_slow),
                 "trend": round(trend * 10000, 1) if isinstance(trend, float) else 0,
+                "alpha_fair": alpha_fair,
+                "alpha_conf": alpha_conf or 0,
             }
-            # Alpha fair values
-            if _alpha:
-                afv, acf = _alpha.get(sym)
-                entry["alpha_fair"] = _safe(afv)
-                entry["alpha_conf"] = round(acf * 100, 1) if acf else 0
-            else:
-                entry["alpha_fair"] = None
-                entry["alpha_conf"] = 0
-            state["products"].append(entry)
+            s["products"].append(entry)
 
-            # Order book depth (top 5 levels each side)
-            ob_data = {"bids": [], "asks": []}
-            for i, (p, v) in enumerate(zip(snap.bid_prices_3, snap.bid_vols_3)):
+            # Orderbook depth
+            ob = {"bids": [], "asks": []}
+            for p, v in zip(snap.bid_prices_3, snap.bid_vols_3):
                 if not math.isnan(p):
-                    ob_data["bids"].append({"price": round(p, 1), "vol": v})
-            for i, (p, v) in enumerate(zip(snap.ask_prices_3, snap.ask_vols_3)):
+                    ob["bids"].append({"price": round(p, 1), "vol": v})
+            for p, v in zip(snap.ask_prices_3, snap.ask_vols_3):
                 if not math.isnan(p):
-                    ob_data["asks"].append({"price": round(p, 1), "vol": v})
-            state["orderbooks"][sym] = ob_data
+                    ob["asks"].append({"price": round(p, 1), "vol": v})
+            s["orderbooks"][sym] = ob
 
-        # Positions from risk manager
-        if _risk:
-            positions = _risk.positions
-            for p in state["products"]:
-                p["position"] = positions.get(p["product"], 0)
-
-        # --- Risk stats ---
+        # -- Risk --
         if _risk:
             rs = _risk.get_stats()
-            state["risk"] = {
+            s["risk"] = {
                 "signals_received": rs["signals_received"],
                 "signals_approved": rs["signals_approved"],
                 "signals_rejected": rs["signals_rejected"],
@@ -279,36 +282,37 @@ class _DashHandler(BaseHTTPRequestHandler):
                 "halted": rs["halted"],
                 "halt_reason": rs["halt_reason"],
                 "strategies_halted": rs["strategies_halted"],
-                "rejection_breakdown": rs["rejection_breakdown"],
+                "rejections": rs["rejection_breakdown"],
             }
         else:
-            state["risk"] = {}
+            s["risk"] = {}
 
-        # --- PnL from API (direct) ---
-        state["pnl_history"] = list(_pnl_from_api)
+        # -- Charts --
+        s["pnl_history"] = list(_pnl_history)
+        s["price_history"] = {
+            sym: list(h)[-_MAX_PTS:] for sym, h in _price_history.items()
+        }
+        s["arb_history"] = list(_arb_history)
 
-        # --- Price history for charts ---
-        state["price_history"] = {}
-        for sym, hist in _price_history.items():
-            state["price_history"][sym] = list(hist)[-_MAX_CHART_POINTS:]
-
-        # --- Arb history ---
-        state["arb_history"] = list(_arb_history)
-
-        # --- Arb current ---
+        # -- Arb current --
         try:
             arb = _bot.cache.arb_snapshot()
-            from strategies import compute_fly_fair
-            etf_ema = 0
-            try:
-                from strategies import get_tracker
-                etf_ema = get_tracker().ema_slow("LON_ETF")
-            except Exception:
-                pass
-            fly_fair = compute_fly_fair(etf_ema) if etf_ema and not math.isnan(etf_ema) else None
-            state["arb"] = {
+            etf_ema = tracker.ema_slow("LON_ETF") if tracker else 0
+            fly_fair = None
+            if (compute_fly_fair_fn and etf_ema
+                    and not math.isnan(etf_ema)):
+                fly_fair = compute_fly_fair_fn(etf_ema)
+            alpha_etf_fair = None
+            if _alpha:
+                try:
+                    aef, _ = _alpha.get("LON_ETF")
+                    alpha_etf_fair = _safe(aef)
+                except Exception:
+                    pass
+            s["arb"] = {
                 "etf_mid": _safe(arb["etf_mid"]),
                 "fair_etf": _safe(arb["fair_etf"]),
+                "alpha_etf_fair": alpha_etf_fair,
                 "gap": _safe(arb["gap"]),
                 "tide_mid": _safe(arb["tide_mid"]),
                 "wx_mid": _safe(arb["wx_mid"]),
@@ -317,50 +321,51 @@ class _DashHandler(BaseHTTPRequestHandler):
                 "fly_fair": _safe(fly_fair),
             }
         except Exception:
-            state["arb"] = {}
+            s["arb"] = {}
 
-        # Active orders
-        if _executor:
-            state["active_orders"] = len(_executor._active_orders)
-        else:
-            state["active_orders"] = 0
+        # -- Executor --
+        s["active_orders"] = (
+            len(_executor._active_orders) if _executor else 0
+        )
 
-        # Data files
-        if _persist:
-            state["data_files"] = _persist.get_all_products_on_disk()
-        else:
-            state["data_files"] = []
-
-        # Dry-run simulator stats
+        # -- Simulator --
         if _simulator:
-            state["simulator"] = _simulator.get_stats()
-        else:
-            state["simulator"] = None
-
-        # Trade volume per product
-        state["trade_volume"] = dict(_trade_volume)
-        state["trade_count"] = dict(_trade_count)
-
-        # Alpha fair values summary
-        if _alpha and _alpha.fair:
-            state["alpha"] = {
-                "fair": {k: _safe(v) for k, v in _alpha.fair.items()},
-                "confidence": {k: round(v * 100, 1) for k, v in _alpha.confidence.items()},
-                "hours_left": round(_alpha._hours_left(), 2),
-                "last_update": round(_alpha.last_update, 1) if _alpha.last_update else None,
+            ss = _simulator.get_stats()
+            s["simulator"] = {
+                "total_pnl": ss["sim_total_pnl"],
+                "realized": ss["sim_realized_pnl"],
+                "unrealized": ss["sim_unrealized_pnl"],
+                "trade_count": ss["sim_trade_count"],
+                "strategy_pnl": ss["sim_strategy_pnl"],
+                "strategy_trades": ss["sim_strategy_trades"],
+                "pnl_history": ss["sim_pnl_history"],
+                "recent_trades": ss["sim_recent_trades"][-20:],
+                "positions": ss["sim_positions"],
             }
         else:
-            state["alpha"] = None
+            s["simulator"] = None
 
-        return state
+        # -- Alpha --
+        if _alpha and _alpha.fair:
+            s["alpha"] = {
+                "fair": {k: _safe(v) for k, v in _alpha.fair.items()},
+                "confidence": {
+                    k: round(v * 100, 1) for k, v in _alpha.confidence.items()
+                },
+                "hours_left": round(_alpha._hours_left(), 2),
+                "last_update": (
+                    round(_alpha.last_update, 1) if _alpha.last_update
+                    else None
+                ),
+            }
+        else:
+            s["alpha"] = None
 
+        # -- Trade volume --
+        s["trade_volume"] = dict(_trade_volume)
+        s["trade_count"] = dict(_trade_count)
 
-def _safe(v):
-    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
-        return None
-    if isinstance(v, float):
-        return round(v, 2)
-    return v
+        return s
 
 
 class Dashboard:
@@ -374,17 +379,19 @@ class Dashboard:
         _simulator = simulator
         _alpha = alpha
         self.port = port
-        self._server: HTTPServer | None = None
-        self._thread: threading.Thread | None = None
-        self._recorder: _Recorder | None = None
+        self._server = None
+        self._thread = None
+        self._recorder = None
 
     def start(self):
-        self._server = HTTPServer(("0.0.0.0", self.port), _DashHandler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._server = HTTPServer(("0.0.0.0", self.port), _Handler)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, daemon=True
+        )
         self._thread.start()
         self._recorder = _Recorder(interval=3.0)
         self._recorder.start()
-        print(f"[DASHBOARD] Live at http://localhost:{self.port}")
+        print(f"[DASHBOARD] http://localhost:{self.port}")
 
     def stop(self):
         if self._recorder:
@@ -393,604 +400,481 @@ class Dashboard:
             self._server.shutdown()
 
 
-# ── HTML PAGE ────────────────────────────────────────────────────────────
-_HTML_PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
+# ===================================================================
+# HTML / JS / CSS
+# ===================================================================
+_HTML = r"""<!DOCTYPE html>
+<html lang="en"><head>
 <meta charset="UTF-8">
-<title>Algothon 2026 Dashboard</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IMCooked - Algothon 2026</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <style>
-  *{margin:0;padding:0;box-sizing:border-box}
-  body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d9;padding:12px 16px}
-  h1{color:#58a6ff;font-size:22px;margin-bottom:2px}
-  .subtitle{color:#484f58;font-size:12px;margin-bottom:12px}
-  h2{color:#8b949e;margin:18px 0 8px;font-size:14px;text-transform:uppercase;letter-spacing:1.5px;border-bottom:1px solid #21262d;padding-bottom:4px}
-  .g2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-  .g3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
-  .g4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
-  .g-auto{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}
-  .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;overflow:hidden}
-  .card-sm{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 10px}
-  .big{font-size:26px;font-weight:bold}
-  .med{font-size:18px;font-weight:600}
-  .green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.blue{color:#58a6ff}.dim{color:#484f58}.white{color:#e6edf3}
-  table{width:100%;border-collapse:collapse;font-size:12px}
-  th{text-align:left;color:#8b949e;border-bottom:1px solid #30363d;padding:3px 6px;font-weight:600}
-  td{padding:3px 6px;border-bottom:1px solid #21262d}
-  .badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:bold}
-  .badge-ok{background:#0d3320;color:#3fb950}.badge-halt{background:#3d1416;color:#f85149}
-  .bar-bg{height:5px;background:#30363d;border-radius:3px;margin-top:3px}
-  .bar-fg{height:5px;border-radius:3px}
-  .depth-row{display:flex;align-items:center;font-size:11px;height:18px;margin:1px 0}
-  .depth-bar{height:16px;min-width:1px;border-radius:2px;opacity:0.7}
-  .depth-price{width:55px;text-align:center;font-weight:600;flex-shrink:0}
-  .depth-vol{width:28px;text-align:right;flex-shrink:0;color:#8b949e;font-size:10px}
-  .depth-left{flex:1;display:flex;justify-content:flex-end;padding-right:4px}
-  .depth-right{flex:1;display:flex;justify-content:flex-start;padding-left:4px}
-  .pos-cell{font-weight:bold;font-size:13px}
-  .tab-bar{display:flex;gap:4px;margin-bottom:6px;flex-wrap:wrap}
-  .tab-btn{background:#21262d;color:#8b949e;border:1px solid #30363d;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:11px}
-  .tab-btn.active{background:#30363d;color:#58a6ff;border-color:#58a6ff}
-  .chart-wrap{position:relative;height:200px}
-  .chart-wrap canvas{position:absolute;top:0;left:0;width:100%!important;height:100%!important}
-  #last-update{color:#484f58;font-size:11px}
-  .pnl-api{font-size:11px;color:#484f58;margin-top:2px}
-  .metric-row{display:flex;justify-content:space-between;padding:2px 0;font-size:12px}
-  .metric-label{color:#8b949e}
-  .pos-bar-wrap{display:flex;align-items:center;gap:4px}
-  .pos-bar-track{width:80px;height:8px;background:#21262d;border-radius:4px;position:relative;overflow:hidden}
-  .pos-bar-center{position:absolute;left:50%;top:0;width:1px;height:100%;background:#484f58}
-  .pos-bar-fill{position:absolute;top:0;height:100%;border-radius:4px}
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--dim:#484f58;--green:#3fb950;--red:#f85149;--blue:#58a6ff;--yellow:#d29922;--purple:#bc8cff;--orange:#f0883e}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);font-size:13px;line-height:1.4}
+.wrap{max-width:1600px;margin:0 auto;padding:10px 14px}
+header{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);margin-bottom:10px}
+header h1{color:var(--blue);font-size:20px;font-weight:700}
+header .meta{color:var(--dim);font-size:11px;text-align:right}
+h2{color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:1.2px;margin:14px 0 6px;font-weight:600}
+.row{display:grid;gap:8px;margin-bottom:8px}
+.r2{grid-template-columns:1fr 1fr}
+.r3{grid-template-columns:1fr 1fr 1fr}
+.r4{grid-template-columns:repeat(4,1fr)}
+.r5{grid-template-columns:repeat(5,1fr)}
+.r-auto{grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
+.c{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:10px;overflow:hidden}
+.c-tight{background:var(--card);border:1px solid var(--border);border-radius:5px;padding:6px 8px}
+.hero{font-size:28px;font-weight:800}
+.big{font-size:20px;font-weight:700}
+.med{font-size:16px;font-weight:600}
+.sm{font-size:11px}
+.lbl{color:var(--dim);font-size:11px;margin-bottom:2px}
+.grn{color:var(--green)}.red{color:var(--red)}.blu{color:var(--blue)}.ylw{color:var(--yellow)}.prp{color:var(--purple)}.dim{color:var(--dim)}.wht{color:#e6edf3}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700}
+.badge-ok{background:#0d3320;color:var(--green)}.badge-halt{background:#3d1416;color:var(--red)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;color:var(--dim);border-bottom:1px solid var(--border);padding:4px 6px;font-weight:600;white-space:nowrap}
+td{padding:4px 6px;border-bottom:1px solid #21262d;white-space:nowrap}
+tr:hover{background:#1c2128}
+.chart-w{position:relative;height:180px}
+.chart-w canvas{position:absolute;inset:0;width:100%!important;height:100%!important}
+.tab-bar{display:flex;gap:3px;margin-bottom:5px;flex-wrap:wrap}
+.tab{background:#21262d;color:var(--dim);border:1px solid var(--border);border-radius:3px;padding:2px 8px;cursor:pointer;font-size:11px}
+.tab.on{background:var(--border);color:var(--blue);border-color:var(--blue)}
+.mr{display:flex;justify-content:space-between;padding:1px 0}
+.bar-t{height:4px;background:#21262d;border-radius:2px;margin-top:2px;overflow:hidden}
+.bar-f{height:4px;border-radius:2px}
+.pos-wrap{display:flex;align-items:center;gap:4px}
+.pos-track{width:70px;height:7px;background:#21262d;border-radius:3px;position:relative;overflow:hidden}
+.pos-mid{position:absolute;left:50%;top:0;width:1px;height:100%;background:var(--dim)}
+.pos-fill{position:absolute;top:0;height:100%;border-radius:3px}
+.edge-pill{display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;font-weight:700}
+.edge-pos{background:#0d3320;color:var(--green)}
+.edge-neg{background:#3d1416;color:var(--red)}
+.depth-row{display:flex;align-items:center;font-size:11px;height:16px;margin:1px 0}
+.d-vol{width:24px;text-align:right;flex-shrink:0;color:var(--dim);font-size:10px}
+.d-bar{height:14px;min-width:1px;border-radius:2px;opacity:0.6}
+.d-price{width:50px;text-align:center;font-weight:600;flex-shrink:0;font-size:11px}
+.d-left{flex:1;display:flex;justify-content:flex-end;padding-right:3px}
+.d-right{flex:1;display:flex;justify-content:flex-start;padding-left:3px}
+@media(max-width:900px){.r4,.r5{grid-template-columns:1fr 1fr}.r3{grid-template-columns:1fr}}
 </style>
-</head>
-<body>
+</head><body>
+<div class="wrap">
 
-<div style="display:flex;justify-content:space-between;align-items:baseline">
-  <div><h1>Algothon 2026 — Live Dashboard</h1><div class="subtitle">Imperial College | Challenge Exchange</div></div>
-  <span id="last-update">Connecting...</span>
-</div>
+<header>
+  <div><h1>IMCooked - Algothon 2026</h1></div>
+  <div class="meta"><span id="clock"></span><br><span id="settle-timer" class="ylw"></span></div>
+</header>
 
-<!-- ═══ ROW 1: PnL + Status ═══ -->
-<h2>Performance & Risk</h2>
-<div class="g4" id="overview-cards"></div>
+<!-- 1. PnL + Status -->
+<div class="row r5" id="hero"></div>
 
-<!-- ═══ ROW 2: PnL chart (from API) ═══ -->
-<h2>PnL History <span class="dim" style="font-size:11px">(from exchange API)</span></h2>
-<div class="card"><div class="chart-wrap"><canvas id="pnl-chart"></canvas></div></div>
+<!-- 2. Alpha Fair Values -->
+<h2>Alpha Fair Values - Settlement Estimates</h2>
+<div class="row r-auto" id="alpha-row"></div>
 
-<!-- ═══ ROW 2b: Simulated PnL (dry-run only) ═══ -->
-<div id="sim-section" style="display:none">
-<h2>Simulated Strategy Performance <span class="dim" style="font-size:11px">(dry-run)</span></h2>
-<div class="g4" id="sim-overview"></div>
-<div class="g2" style="margin-top:10px">
-  <div class="card"><div class="chart-wrap" style="height:220px"><canvas id="sim-pnl-chart"></canvas></div></div>
-  <div>
-    <div class="card" id="sim-strategy-table" style="max-height:220px;overflow-y:auto"></div>
+<!-- 3. Markets and Positions -->
+<h2>Markets and Positions</h2>
+<div class="c" style="overflow-x:auto"><table id="mkt-table">
+  <thead><tr>
+    <th>Product</th><th>Bid</th><th>Ask</th><th>Spread</th><th>Mid</th>
+    <th>Fair Value</th><th>Edge</th><th>Conf</th>
+    <th>Imbalance</th><th>Volume B/A</th><th>Position</th>
+  </tr></thead>
+  <tbody></tbody>
+</table></div>
+
+<!-- 4. Charts: PnL + Prices -->
+<h2>Charts</h2>
+<div class="row r2">
+  <div class="c">
+    <div class="lbl">PnL Over Time</div>
+    <div class="chart-w"><canvas id="ch-pnl"></canvas></div>
+  </div>
+  <div class="c">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+      <div class="lbl">Prices</div>
+      <div>
+        <button id="hist-btn" onclick="toggleHistory()" class="tab" style="font-size:10px">Load History</button>
+        <span id="hist-status" class="dim sm"></span>
+      </div>
+    </div>
+    <div class="tab-bar" id="p-tabs"></div>
+    <div class="chart-w" style="height:200px"><canvas id="ch-price"></canvas></div>
   </div>
 </div>
-<div class="card" style="margin-top:10px;max-height:200px;overflow-y:auto">
-  <div style="font-size:11px;color:#8b949e;margin-bottom:4px">Recent Simulated Trades</div>
-  <table id="sim-trades-table">
-    <thead><tr><th>Time</th><th>Strategy</th><th>Side</th><th>Product</th><th>Vol</th><th>Price</th><th>Realized</th><th>Pos After</th></tr></thead>
-    <tbody></tbody>
-  </table>
-</div>
-</div>
 
-<!-- ═══ ROW 2a: Alpha Fair Values ═══ -->
-<div id="alpha-section" style="display:none">
-<h2>Alpha Fair Values <span class="dim" style="font-size:11px">(real-world data → settlement estimates)</span></h2>
-<div class="g-auto" id="alpha-cards"></div>
+<!-- 5. ETF and FLY Arbitrage -->
+<h2>Arbitrage</h2>
+<div class="row r3">
+  <div class="c" id="arb-etf"></div>
+  <div class="c" id="arb-fly"></div>
+  <div class="c"><div class="lbl">ETF Gap History</div><div class="chart-w"><canvas id="ch-arb"></canvas></div></div>
 </div>
 
-<!-- ═══ ROW 3: Products table + Positions ═══ -->
-<h2>Markets & Positions</h2>
-<div class="card" style="overflow-x:auto">
-  <table id="products-table">
-    <thead><tr>
-      <th>Product</th><th>Bid</th><th>Ask</th><th>Spread</th><th>Mid</th>
-      <th>Fair</th><th>Conf</th>
-      <th>EMA-F</th><th>EMA-S</th><th>Vol (bps)</th><th>Trend</th>
-      <th>Imbalance</th><th>Position</th>
-    </tr></thead>
-    <tbody></tbody>
-  </table>
+<!-- 6. Order Book Depth -->
+<h2>Order Books</h2>
+<div class="row r-auto" id="ob-row"></div>
+
+<!-- 7. Strategy Performance + Recent Trades -->
+<h2>Strategy Performance</h2>
+<div class="row r2">
+  <div class="c" id="strat-table"></div>
+  <div class="c" style="max-height:260px;overflow-y:auto">
+    <div class="lbl">Recent Fills</div>
+    <table id="trade-log"><thead><tr><th>Time</th><th>Strategy</th><th>Side</th><th>Product</th><th>Vol</th><th>Price</th><th>PnL</th></tr></thead><tbody></tbody></table>
+  </div>
 </div>
 
-<!-- ═══ ROW 4: Price Charts ═══ -->
-<h2>Price Charts <button id="history-btn" onclick="loadFullHistory()" style="margin-left:12px;padding:3px 12px;background:#238636;color:#fff;border:1px solid #2ea043;border-radius:6px;cursor:pointer;font-size:12px">Load Full History</button> <span id="history-status" class="dim" style="font-size:11px"></span></h2>
-<div class="card">
-  <div class="tab-bar" id="price-tabs"></div>
-  <div class="chart-wrap" style="height:300px"><canvas id="price-chart"></canvas></div>
+<!-- 8. Risk and Signals -->
+<h2>Risk and Signals</h2>
+<div class="row r-auto" id="risk-row"></div>
+
 </div>
-
-<!-- ═══ ROW 5: Order Book Depth ═══ -->
-<h2>Order Book Depth</h2>
-<div class="g3" id="ob-section"></div>
-
-<!-- ═══ ROW 6: ETF Arbitrage ═══ -->
-<h2>ETF & FLY Arbitrage</h2>
-<div class="g2">
-  <div id="arb-cards" class="g2"></div>
-  <div class="card"><div class="chart-wrap"><canvas id="arb-chart"></canvas></div></div>
-</div>
-
-<!-- ═══ ROW 7: Volatility & Advanced Metrics ═══ -->
-<h2>Volatility & Metrics</h2>
-<div class="g-auto" id="vol-section"></div>
-
-<!-- ═══ ROW 8: Signal Stats ═══ -->
-<h2>Signal & Rejection Stats</h2>
-<div class="g-auto" id="signal-section"></div>
-
-<!-- ═══ ROW 9: Market Volume ═══ -->
-<h2>Market Volume <span class="dim" style="font-size:11px">(traded this session)</span></h2>
-<div class="g-auto" id="volume-section"></div>
 
 <script>
-/* ── helpers ── */
-const $=s=>document.querySelector(s);
-const fmt=(v,d=2)=>v==null?'—':Number(v).toFixed(d);
-const clr=v=>v==null?'dim':v>=0?'green':'red';
-const COLORS=['#58a6ff','#3fb950','#f0883e','#bc8cff','#f85149','#d29922','#79c0ff','#ff7b72'];
+var $sel=function(s){return document.querySelector(s)};
+var fmt=function(v,d){d=d||1;return v==null||v===undefined?'\u2014':Number(v).toFixed(d)};
+var clr=function(v){return v==null?'dim':v>=0?'grn':'red'};
+var COLORS=['#58a6ff','#3fb950','#f0883e','#bc8cff','#f85149','#d29922','#79c0ff','#ff7b72'];
 
-/* ── Chart.js instances ── */
-let pnlChart=null, priceChart=null, arbChart=null, simPnlChart=null;
-let activePriceTab='ALL';
-let fullHistoryData=null;
-let historyMode=false;
+var chPnl=null, chPrice=null, chArb=null;
+var activeTab='ALL', histData=null, histMode=false;
 
-function createLineChart(canvas, datasets, yLabel, xIsTime=true){
-  const ctx=canvas.getContext('2d');
-  return new Chart(ctx,{
-    type:'line',
-    data:{datasets},
+function mkChart(el, datasets, opts){
+  opts=opts||{};
+  return new Chart(el.getContext('2d'),{
+    type:'line', data:{datasets:datasets},
     options:{
       responsive:true, maintainAspectRatio:false, animation:false,
       interaction:{mode:'index',intersect:false},
       scales:{
-        x:{type:'linear',display:true,ticks:{callback:v=>{const d=new Date(v*1000);return d.getHours()+':'+String(d.getMinutes()).padStart(2,'0')},maxTicksLimit:8,color:'#484f58'},grid:{color:'#21262d'}},
-        y:{display:true,ticks:{color:'#484f58',maxTicksLimit:6},grid:{color:'#21262d'}}
+        x:{type:'linear',display:true,ticks:{callback:function(v){var d=new Date(v*1000);return d.getHours()+':'+String(d.getMinutes()).padStart(2,'0')},maxTicksLimit:6,color:'#484f58'},grid:{color:'#1c2128'}},
+        y:{display:true,ticks:{color:'#484f58',maxTicksLimit:5},grid:{color:'#1c2128'}}
       },
-      plugins:{legend:{display:datasets.length>1,position:'top',labels:{color:'#8b949e',boxWidth:10,font:{size:10}}},tooltip:{enabled:true}}
+      plugins:{legend:{display:datasets.length>1,position:'top',labels:{color:'#8b949e',boxWidth:8,font:{size:10}}},tooltip:{enabled:true}}
     }
   });
 }
 
-function updateLineChart(chart, datasets){
-  if(!chart)return;
-  chart.data.datasets=datasets;
-  chart.update('none');
-}
+function updChart(ch, ds){if(ch){ch.data.datasets=ds;ch.update('none');}}
 
-/* ── PnL chart ── */
-function updatePnlChart(data){
-  if(!data||!data.length)return;
-  const ds=[{label:'PnL',data:data.map(d=>({x:d.t,y:d.pnl})),borderColor:'#3fb950',backgroundColor:'rgba(63,185,80,0.1)',fill:true,borderWidth:2,pointRadius:0,tension:0.3}];
-  if(!pnlChart){pnlChart=createLineChart($('#pnl-chart'),ds,'PnL');}
-  else updateLineChart(pnlChart,ds);
-}
-
-/* ── Simulated PnL (dry-run) ── */
-function renderSimulator(sim){
-  const section=$('#sim-section');
-  if(!sim){section.style.display='none';return;}
-  section.style.display='block';
-
-  const totalPnl=sim.sim_total_pnl||0;
-  const realPnl=sim.sim_realized_pnl||0;
-  const unrealPnl=sim.sim_unrealized_pnl||0;
-  const dd=sim.sim_drawdown||0;
-  const trades=sim.sim_trade_count||0;
-  const exposure=sim.sim_exposure||0;
-
-  // Overview cards
-  $('#sim-overview').innerHTML=`
-    <div class="card">
-      <div class="dim">Simulated Total PnL</div>
-      <div class="big ${clr(totalPnl)}">${fmt(totalPnl,0)}</div>
-      <div class="pnl-api">Realized: <span class="${clr(realPnl)}">${fmt(realPnl,0)}</span> | Unrealized: <span class="${clr(unrealPnl)}">${fmt(unrealPnl,0)}</span></div>
-    </div>
-    <div class="card">
-      <div class="dim">Sim Drawdown</div>
-      <div class="med ${clr(dd)}">${fmt(dd,0)}</div>
-      <div class="pnl-api">Peak: ${fmt(sim.sim_peak_pnl,0)}</div>
-    </div>
-    <div class="card">
-      <div class="dim">Sim Trades</div>
-      <div class="med white">${trades}</div>
-      <div class="pnl-api">Exposure: ${exposure}</div>
-    </div>
-    <div class="card">
-      <div class="dim">Sim Positions</div>
-      ${Object.entries(sim.sim_positions||{}).filter(([k,v])=>v!==0).map(([k,v])=>`<div class="metric-row"><span class="metric-label">${k}</span><span class="${clr(v)}">${v>0?'+':''}${v}</span></div>`).join('')||'<div class="dim" style="font-size:11px">Flat</div>'}
-    </div>
-  `;
-
-  // PnL chart
-  const pnlHist=sim.sim_pnl_history||[];
-  if(pnlHist.length){
-    const ds=[
-      {label:'Sim Total PnL',data:pnlHist.map(d=>({x:d[0],y:d[1]})),borderColor:'#bc8cff',backgroundColor:'rgba(188,140,255,0.1)',fill:true,borderWidth:2,pointRadius:0,tension:0.3}
-    ];
-    if(!simPnlChart){simPnlChart=createLineChart($('#sim-pnl-chart'),ds,'Sim PnL');}
-    else updateLineChart(simPnlChart,ds);
-  }
-
-  // Strategy table
-  const spnl=sim.sim_strategy_pnl||{};
-  const strades=sim.sim_strategy_trades||{};
-  const svol=sim.sim_strategy_volume||{};
-  const strats=Object.keys(spnl);
-  let stratHtml='<div style="font-size:11px;color:#8b949e;margin-bottom:4px">Per-Strategy Attribution</div>';
-  if(strats.length){
-    stratHtml+='<table><thead><tr><th>Strategy</th><th>PnL</th><th>Trades</th><th>Volume</th></tr></thead><tbody>';
-    strats.sort((a,b)=>(spnl[b]||0)-(spnl[a]||0));
-    strats.forEach(s=>{
-      stratHtml+=`<tr><td><strong class="white">${s.replace('dispatch_','')}</strong></td><td class="${clr(spnl[s])}">${fmt(spnl[s],0)}</td><td>${strades[s]||0}</td><td>${svol[s]||0}</td></tr>`;
-    });
-    stratHtml+='</tbody></table>';
-  } else { stratHtml+='<div class="dim">No trades yet</div>'; }
-  $('#sim-strategy-table').innerHTML=stratHtml;
-
-  // Recent trades table
-  const recent=sim.sim_recent_trades||[];
-  const tbody=$('#sim-trades-table tbody');
-  tbody.innerHTML=recent.slice().reverse().map(t=>{
-    const d=new Date(t.time*1000);
-    const ts=d.getHours()+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0');
-    return `<tr>
-      <td class="dim">${ts}</td>
-      <td>${(t.strategy||'').replace('dispatch_','')}</td>
-      <td class="${t.side==='BUY'?'green':'red'}">${t.side}</td>
-      <td class="white">${t.product}</td>
-      <td>${t.volume}</td>
-      <td>${fmt(t.price,0)}</td>
-      <td class="${clr(t.realized_pnl)}">${t.realized_pnl!==0?fmt(t.realized_pnl,0):'—'}</td>
-      <td class="${clr(t.position_after)}">${t.position_after}</td>
-    </tr>`;
-  }).join('');
-}
-
-/* ── Price chart ── */
-function updatePriceChart(history, tab){
-  const products=Object.keys(history);
-  if(!products.length)return;
-  let ds=[];
-  if(tab==='ALL'){
-    products.forEach((sym,i)=>{
-      const pts=history[sym]||[];
-      if(!pts.length)return;
-      // Normalize to percentage change for ALL view
-      const base=pts[0].mid;
-      ds.push({label:sym,data:pts.map(p=>({x:p.t,y:((p.mid-base)/base*100)})),borderColor:COLORS[i%COLORS.length],borderWidth:1.5,pointRadius:0,tension:0.3});
-    });
-  } else {
-    const pts=history[tab]||[];
-    if(pts.length){
-      ds.push({label:tab+' Mid',data:pts.map(p=>({x:p.t,y:p.mid})),borderColor:'#58a6ff',borderWidth:2,pointRadius:0,tension:0.3});
-      const bidPts=pts.filter(p=>p.bid!=null);
-      if(bidPts.length) ds.push({label:'Bid',data:bidPts.map(p=>({x:p.t,y:p.bid})),borderColor:'rgba(63,185,80,0.4)',borderWidth:1,pointRadius:0,borderDash:[3,3]});
-      const askPts=pts.filter(p=>p.ask!=null);
-      if(askPts.length) ds.push({label:'Ask',data:askPts.map(p=>({x:p.t,y:p.ask})),borderColor:'rgba(248,81,73,0.4)',borderWidth:1,pointRadius:0,borderDash:[3,3]});
-    }
-  }
-  if(!priceChart){priceChart=createLineChart($('#price-chart'),ds,'Price');}
-  else updateLineChart(priceChart,ds);
-}
-
-/* ── Arb chart ── */
-function updateArbChart(data){
-  if(!data||!data.length)return;
-  const ds=[
-    {label:'ETF Mid',data:data.map(d=>({x:d.t,y:d.etf_mid})),borderColor:'#58a6ff',borderWidth:1.5,pointRadius:0,tension:0.3},
-    {label:'Fair Value',data:data.map(d=>({x:d.t,y:d.fair})),borderColor:'#3fb950',borderWidth:1.5,pointRadius:0,tension:0.3,borderDash:[4,4]}
-  ];
-  if(!arbChart){arbChart=createLineChart($('#arb-chart'),ds,'ETF vs Fair');}
-  else updateLineChart(arbChart,ds);
-}
-
-/* ── Order Book Depth Visualization ── */
-function renderOrderBooks(products, orderbooks){
-  const section=$('#ob-section');
-  let html='';
-  for(const p of products){
-    const sym=p.product;
-    const ob=orderbooks[sym];
-    if(!ob)continue;
-    const bids=(ob.bids||[]).slice(0,5);
-    const asks=(ob.asks||[]).slice(0,5);
-    const maxVol=Math.max(...bids.map(b=>b.vol),...asks.map(a=>a.vol),1);
-
-    // Merge into ladder (asks reversed on top, bids below)
-    let rows='';
-    // Asks (reversed so best ask is at bottom)
-    const asksRev=[...asks].reverse();
-    for(const a of asksRev){
-      const pct=(a.vol/maxVol*100).toFixed(0);
-      rows+=`<div class="depth-row">
-        <span class="depth-vol"></span>
-        <div class="depth-left"></div>
-        <span class="depth-price red">${fmt(a.price,0)}</span>
-        <div class="depth-right"><div class="depth-bar" style="width:${pct}%;background:#f85149"></div></div>
-        <span class="depth-vol">${a.vol}</span>
-      </div>`;
-    }
-    // Spread line
-    const sp=p.spread!=null?fmt(p.spread,1):'—';
-    rows+=`<div class="depth-row" style="justify-content:center"><span class="dim" style="font-size:10px">spread: ${sp}</span></div>`;
-    // Bids
-    for(const b of bids){
-      const pct=(b.vol/maxVol*100).toFixed(0);
-      rows+=`<div class="depth-row">
-        <span class="depth-vol">${b.vol}</span>
-        <div class="depth-left"><div class="depth-bar" style="width:${pct}%;background:#3fb950"></div></div>
-        <span class="depth-price green">${fmt(b.price,0)}</span>
-        <div class="depth-right"></div>
-        <span class="depth-vol"></span>
-      </div>`;
-    }
-
-    html+=`<div class="card-sm">
-      <div style="display:flex;justify-content:space-between;margin-bottom:4px">
-        <strong class="white">${sym}</strong>
-        <span class="dim" style="font-size:10px">${bids.length}b/${asks.length}a levels</span>
-      </div>
-      ${rows}
-    </div>`;
-  }
-  section.innerHTML=html||'<div class="card"><div class="dim">No order book data</div></div>';
-}
-
-/* ── Position Bar ── */
 function posBar(pos){
-  const absPos=Math.abs(pos);
-  const pct=(absPos/100*50);  // 100 is max, 50% is half the bar
-  const left=pos>=0?50:50-pct;
-  const c=pos>=0?'#3fb950':'#f85149';
-  return `<div class="pos-bar-wrap">
-    <span class="pos-cell ${clr(pos)}">${pos}</span>
-    <div class="pos-bar-track">
-      <div class="pos-bar-center"></div>
-      <div class="pos-bar-fill" style="left:${left}%;width:${pct}%;background:${c}"></div>
-    </div>
-  </div>`;
+  var a=Math.abs(pos), p=(a/100*50);
+  var l=pos>=0?50:50-p;
+  var c=pos>=0?'var(--green)':'var(--red)';
+  var warn=a>=60?' ylw':'';
+  return '<div class="pos-wrap">'+
+    '<strong class="'+clr(pos)+warn+'" style="width:30px;text-align:right">'+pos+'</strong>'+
+    '<div class="pos-track"><div class="pos-mid"></div><div class="pos-fill" style="left:'+l+'%;width:'+p+'%;background:'+c+'"></div></div>'+
+  '</div>';
 }
 
-/* ── RENDER ── */
-function render(state){
-  const r=state.risk||{};
-  const pnlHist=state.pnl_history||[];
-  const latestPnl=pnlHist.length?pnlHist[pnlHist.length-1].pnl:null;
-  const dd=r.drawdown||0;
-  const halted=r.halted;
+function edgePill(mid, fair){
+  if(mid==null||fair==null||mid===0) return '<span class="dim">\u2014</span>';
+  var e=(fair-mid)/mid*100;
+  var cls=e>=0?'edge-pos':'edge-neg';
+  return '<span class="edge-pill '+cls+'">'+(e>=0?'+':'')+e.toFixed(1)+'%</span>';
+}
 
-  // -- Overview cards --
-  $('#overview-cards').innerHTML=`
-    <div class="card">
-      <div class="dim">PnL (API)</div>
-      <div class="big ${clr(latestPnl)}">${latestPnl!=null?fmt(latestPnl,0):'—'}</div>
-      <div class="pnl-api">Local tracking: ${fmt(r.pnl,0)}</div>
-    </div>
-    <div class="card">
-      <div class="dim">Status</div>
-      <div class="med"><span class="badge ${halted?'badge-halt':'badge-ok'}">${halted?'HALTED':'RUNNING'}</span></div>
-      ${halted?'<div class="dim" style="margin-top:4px">'+((r.halt_reason||''))+'</div>':''}
-      ${(r.strategies_halted||[]).length?'<div class="dim" style="margin-top:2px;font-size:11px">Strats halted: '+(r.strategies_halted.join(', '))+'</div>':''}
-    </div>
-    <div class="card">
-      <div class="dim">Signals</div>
-      <div class="med">${r.signals_approved||0} <span class="dim" style="font-size:12px">/ ${r.signals_received||0}</span></div>
-      <div class="dim" style="font-size:11px">Approval: ${fmt(r.approval_rate,1)}% | Rej: ${r.signals_rejected||0}</div>
-    </div>
-    <div class="card">
-      <div class="dim">Risk</div>
-      <div class="metric-row"><span class="metric-label">Peak PnL</span><span>${fmt(r.peak_pnl,0)}</span></div>
-      <div class="metric-row"><span class="metric-label">Drawdown</span><span class="${clr(dd)}">${fmt(dd,0)}</span></div>
-      <div class="metric-row"><span class="metric-label">Active Orders</span><span>${state.active_orders||0}</span></div>
-      <div class="metric-row"><span class="metric-label">Data Files</span><span>${(state.data_files||[]).length}</span></div>
-    </div>
-  `;
+function render(S){
+  var r=S.risk||{};
+  var prods=S.products||[];
+  var sim=S.simulator;
+  var alpha=S.alpha;
+  var arb=S.arb||{};
 
-  // -- PnL chart --
-  updatePnlChart(pnlHist);
+  // Clock + settlement timer
+  var now=new Date(S.time*1000);
+  $sel('#clock').textContent='Updated '+now.toLocaleTimeString();
+  if(alpha&&alpha.hours_left!=null){
+    var h=alpha.hours_left;
+    $sel('#settle-timer').textContent=h>0?'Settlement in '+h.toFixed(1)+'h':'Settlement passed';
+  }
 
-  // -- Simulated PnL (dry-run) --
-  renderSimulator(state.simulator);
+  // 1. Hero cards
+  var pnlH=S.pnl_history||[];
+  var curPnl=pnlH.length?pnlH[pnlH.length-1].pnl:(r.pnl||null);
+  var prevPnl=pnlH.length>10?pnlH[pnlH.length-11].pnl:null;
+  var pnlDelta=(curPnl!=null&&prevPnl!=null)?curPnl-prevPnl:null;
+  var totalPos=prods.reduce(function(a,p){return a+Math.abs(p.position||0)},0);
+  var maxExposure=800;
+  var expPct=(totalPos/maxExposure*100);
+  var simPnl=sim?sim.total_pnl:null;
+  var halted=r.halted;
 
-  // -- Alpha fair values --
-  const alpha=state.alpha;
-  const alphaSection=$('#alpha-section');
-  if(alpha && alpha.fair && Object.keys(alpha.fair).length){
-    alphaSection.style.display='block';
-    const fairs=alpha.fair;
-    const confs=alpha.confidence||{};
-    let aHtml=`<div class="card-sm" style="min-width:180px">
-      <div class="dim">Settlement In</div>
-      <div class="big blue">${fmt(alpha.hours_left,1)}h</div>
-      <div class="dim" style="font-size:11px">Last update: ${alpha.last_update?new Date(alpha.last_update*1000).toLocaleTimeString():'—'}</div>
-    </div>`;
-    const products=state.products||[];
-    Object.entries(fairs).sort().forEach(([prod,fair])=>{
+  var heroHtml='<div class="c">'+
+    '<div class="lbl">PnL (Exchange)</div>'+
+    '<div class="hero '+clr(curPnl)+'">'+(curPnl!=null?Math.round(curPnl).toLocaleString():'\u2014')+'</div>';
+  if(pnlDelta!=null) heroHtml+='<div class="sm '+clr(pnlDelta)+'">delta30s: '+(pnlDelta>=0?'+':'')+Math.round(pnlDelta).toLocaleString()+'</div>';
+  heroHtml+='</div>';
+
+  heroHtml+='<div class="c">'+
+    '<div class="lbl">Peak / Drawdown</div>'+
+    '<div class="big wht">'+fmt(r.peak_pnl,0)+'</div>'+
+    '<div class="sm '+clr(r.drawdown)+'">DD: '+fmt(r.drawdown,0)+'</div>'+
+  '</div>';
+
+  heroHtml+='<div class="c">'+
+    '<div class="lbl">Exposure</div>'+
+    '<div class="big '+(expPct>90?'red':expPct>70?'ylw':'wht')+'">'+totalPos+' / '+maxExposure+'</div>'+
+    '<div class="bar-t"><div class="bar-f" style="width:'+expPct+'%;background:'+(expPct>80?'var(--red)':expPct>50?'var(--yellow)':'var(--green)')+'"></div></div>'+
+  '</div>';
+
+  heroHtml+='<div class="c">'+
+    '<div class="lbl">Signals</div>'+
+    '<div class="big wht">'+(r.signals_approved||0)+'<span class="dim sm"> / '+(r.signals_received||0)+'</span></div>'+
+    '<div class="sm dim">Rate: '+fmt(r.approval_rate,0)+'% | Orders: '+(S.active_orders||0)+'</div>'+
+  '</div>';
+
+  heroHtml+='<div class="c">'+
+    '<div class="lbl">Status</div>'+
+    '<div class="med"><span class="badge '+(halted?'badge-halt':'badge-ok')+'">'+(halted?'HALTED':'LIVE')+'</span></div>';
+  if(halted) heroHtml+='<div class="sm red">'+(r.halt_reason||'')+'</div>';
+  if(sim) heroHtml+='<div class="sm prp" style="margin-top:4px">Sim PnL: '+fmt(simPnl,0)+'</div>';
+  heroHtml+='</div>';
+
+  $sel('#hero').innerHTML=heroHtml;
+
+  // 2. Alpha fair values
+  if(alpha&&alpha.fair){
+    var fairs=alpha.fair;
+    var confs=alpha.confidence||{};
+    var ah='';
+    Object.keys(fairs).sort().forEach(function(prod){
+      var fair=fairs[prod];
       if(fair==null)return;
-      const conf=confs[prod]||0;
-      const mp=products.find(p=>p.product===prod);
-      const mid=mp?mp.mid:null;
-      const edge=mid&&fair?((fair-mid)/mid*100):null;
-      const edgeStr=edge!=null?`${edge>=0?'+':''}${edge.toFixed(1)}%`:'—';
-      aHtml+=`<div class="card-sm">
-        <div style="display:flex;justify-content:space-between"><strong class="white">${prod}</strong><span class="dim">${conf.toFixed(0)}% conf</span></div>
-        <div class="metric-row"><span class="metric-label">Fair</span><span class="blue">${fmt(fair,0)}</span></div>
-        <div class="metric-row"><span class="metric-label">Market</span><span>${mid!=null?fmt(mid,0):'—'}</span></div>
-        <div class="metric-row"><span class="metric-label">Edge</span><span class="${edge>=0?'green':'red'}">${edgeStr}</span></div>
-        <div class="bar-bg"><div class="bar-fg" style="width:${conf}%;background:#58a6ff"></div></div>
-      </div>`;
+      var conf=confs[prod]||0;
+      var mp=prods.find(function(p){return p.product===prod});
+      var mid=mp?mp.mid:null;
+      ah+='<div class="c-tight">'+
+        '<div style="display:flex;justify-content:space-between"><strong class="wht">'+prod+'</strong>'+edgePill(mid,fair)+'</div>'+
+        '<div class="mr"><span class="dim">Fair</span><span class="blu">'+fmt(fair,0)+'</span></div>'+
+        '<div class="mr"><span class="dim">Market</span><span>'+(mid!=null?fmt(mid,0):'\u2014')+'</span></div>'+
+        '<div class="bar-t"><div class="bar-f" style="width:'+conf+'%;background:var(--blue)"></div></div>'+
+        '<div class="sm dim" style="text-align:right">'+conf.toFixed(0)+'% confidence</div>'+
+      '</div>';
     });
-    $('#alpha-cards').innerHTML=aHtml;
-  } else { alphaSection.style.display='none'; }
-
-  // -- Products table (with alpha columns) --
-  const tbody=$('#products-table tbody');
-  tbody.innerHTML=(state.products||[]).map(p=>`
-    <tr>
-      <td><strong class="white">${p.product}</strong></td>
-      <td class="green">${fmt(p.best_bid,0)}</td>
-      <td class="red">${fmt(p.best_ask,0)}</td>
-      <td>${fmt(p.spread,1)}</td>
-      <td class="white">${fmt(p.mid,1)}</td>
-      <td class="blue">${p.alpha_fair!=null?fmt(p.alpha_fair,0):'—'}</td>
-      <td class="dim">${p.alpha_conf?p.alpha_conf+'%':'—'}</td>
-      <td class="blue">${fmt(p.ema_fast,1)}</td>
-      <td>${fmt(p.ema_slow,1)}</td>
-      <td class="yellow">${fmt(p.volatility,1)}</td>
-      <td class="${p.trend>=0?'green':'red'}">${fmt(p.trend,1)}</td>
-      <td><span class="${p.imbalance>=0?'green':'red'}">${fmt(p.imbalance,3)}</span></td>
-      <td>${posBar(p.position)}</td>
-    </tr>
-  `).join('');
-
-  // -- Price tabs --
-  const liveHistory=state.price_history||{};
-  const priceHistory=historyMode&&fullHistoryData?fullHistoryData:liveHistory;
-  const syms=Object.keys(priceHistory);
-  const tabBar=$('#price-tabs');
-  if(tabBar.children.length===0 || tabBar.dataset.syms!==syms.join(',')){
-    tabBar.dataset.syms=syms.join(',');
-    let tabHtml=`<button class="tab-btn ${activePriceTab==='ALL'?'active':''}" onclick="setTab('ALL')">ALL (%)</button>`;
-    syms.forEach(s=>{tabHtml+=`<button class="tab-btn ${activePriceTab===s?'active':''}" onclick="setTab('${s}')">${s}</button>`;});
-    tabBar.innerHTML=tabHtml;
+    if(!ah) ah='<div class="c-tight"><div class="dim">Alpha engine warming up...</div></div>';
+    $sel('#alpha-row').innerHTML=ah;
+  } else {
+    $sel('#alpha-row').innerHTML='<div class="c-tight"><div class="dim">Alpha engine not connected</div></div>';
   }
-  updatePriceChart(priceHistory, activePriceTab);
 
-  // -- Order books --
-  renderOrderBooks(state.products||[], state.orderbooks||{});
+  // 3. Markets table
+  var tb=$sel('#mkt-table tbody');
+  tb.innerHTML=prods.map(function(p){
+    var edge=edgePill(p.mid, p.alpha_fair);
+    return '<tr>'+
+      '<td><strong class="wht">'+p.product+'</strong></td>'+
+      '<td class="grn">'+fmt(p.best_bid,0)+'</td>'+
+      '<td class="red">'+fmt(p.best_ask,0)+'</td>'+
+      '<td>'+fmt(p.spread,1)+'</td>'+
+      '<td class="wht">'+fmt(p.mid,0)+'</td>'+
+      '<td class="blu">'+(p.alpha_fair!=null?fmt(p.alpha_fair,0):'\u2014')+'</td>'+
+      '<td>'+edge+'</td>'+
+      '<td class="dim">'+(p.alpha_conf?p.alpha_conf.toFixed(0)+'%':'\u2014')+'</td>'+
+      '<td><span class="'+(p.imbalance>=0?'grn':'red')+'">'+fmt(p.imbalance,3)+'</span></td>'+
+      '<td class="dim">'+p.bid_vol+'/'+p.ask_vol+'</td>'+
+      '<td>'+posBar(p.position)+'</td>'+
+    '</tr>';
+  }).join('');
 
-  // -- Arb section --
-  const arb=state.arb||{};
-  $('#arb-cards').innerHTML=`
-    <div class="card-sm">
-      <div class="dim">LON_ETF vs Fair</div>
-      <div class="med">${fmt(arb.etf_mid,0)} <span class="dim" style="font-size:12px">vs</span> <span class="green">${fmt(arb.fair_etf,0)}</span></div>
-      <div class="metric-row"><span class="metric-label">Gap</span><span class="big ${clr(arb.gap)}">${fmt(arb.gap,0)}</span></div>
-    </div>
-    <div class="card-sm">
-      <div class="dim">Components</div>
-      <div class="metric-row"><span class="metric-label">TIDE_SPOT</span><span>${fmt(arb.tide_mid,0)}</span></div>
-      <div class="metric-row"><span class="metric-label">WX_SPOT</span><span>${fmt(arb.wx_mid,0)}</span></div>
-      <div class="metric-row"><span class="metric-label">LHR_COUNT</span><span>${fmt(arb.lhr_mid,0)}</span></div>
-      <div class="metric-row" style="margin-top:4px;border-top:1px solid #21262d;padding-top:4px"><span class="metric-label">LON_FLY Mid</span><span>${fmt(arb.fly_mid,0)}</span></div>
-      <div class="metric-row"><span class="metric-label">FLY Fair</span><span class="green">${fmt(arb.fly_fair,0)}</span></div>
-    </div>
-  `;
-  updateArbChart(state.arb_history||[]);
+  // 4a. PnL chart
+  if(pnlH.length){
+    var pnlDs=[{label:'PnL',data:pnlH.map(function(d){return{x:d.t,y:d.pnl}}),borderColor:'#3fb950',backgroundColor:'rgba(63,185,80,0.08)',fill:true,borderWidth:2,pointRadius:0,tension:0.3}];
+    if(sim&&sim.pnl_history&&sim.pnl_history.length){
+      pnlDs.push({label:'Sim PnL',data:sim.pnl_history.map(function(d){return{x:d[0],y:d[1]}}),borderColor:'#bc8cff',borderWidth:1.5,pointRadius:0,tension:0.3,borderDash:[4,4]});
+    }
+    if(!chPnl) chPnl=mkChart($sel('#ch-pnl'),pnlDs);
+    else updChart(chPnl,pnlDs);
+  }
 
-  // -- Volatility & metrics --
-  const volHtml=(state.products||[]).map(p=>`
-    <div class="card-sm">
-      <div style="display:flex;justify-content:space-between"><strong class="white">${p.product}</strong><span class="yellow">${fmt(p.volatility,1)} bps</span></div>
-      <div class="metric-row"><span class="metric-label">EMA Fast</span><span class="blue">${fmt(p.ema_fast,1)}</span></div>
-      <div class="metric-row"><span class="metric-label">EMA Slow</span><span>${fmt(p.ema_slow,1)}</span></div>
-      <div class="metric-row"><span class="metric-label">Trend</span><span class="${p.trend>=0?'green':'red'}">${fmt(p.trend,1)} bps</span></div>
-      <div class="metric-row"><span class="metric-label">Micro Price</span><span>${fmt(p.micro_price,1)}</span></div>
-      <div class="metric-row"><span class="metric-label">Wtd Mid</span><span>${fmt(p.weighted_mid,1)}</span></div>
-      <div class="metric-row"><span class="metric-label">Bid/Ask Vol</span><span>${p.bid_vol}/${p.ask_vol}</span></div>
-      <div class="metric-row"><span class="metric-label">Levels B/A</span><span>${p.bid_levels}/${p.ask_levels}</span></div>
-      <div class="metric-row"><span class="metric-label">Top Imb</span><span class="${p.top_imbalance>=0?'green':'red'}">${fmt(p.top_imbalance,3)}</span></div>
-    </div>
-  `).join('');
-  $('#vol-section').innerHTML=volHtml||'<div class="card"><div class="dim">Waiting for data...</div></div>';
+  // 4b. Price chart
+  var liveH=S.price_history||{};
+  var pH=histMode&&histData?histData:liveH;
+  var syms=Object.keys(pH);
+  var tb2=$sel('#p-tabs');
+  if(tb2.children.length===0||tb2.dataset.k!==syms.join()){
+    tb2.dataset.k=syms.join();
+    var tabsHtml='<div class="tab '+(activeTab==='ALL'?'on':'')+'" onclick="setTab(\'ALL\')">ALL %</div>';
+    syms.forEach(function(s){
+      tabsHtml+='<div class="tab '+(activeTab===s?'on':'')+'" onclick="setTab(\''+s+'\')">'+s+'</div>';
+    });
+    tb2.innerHTML=tabsHtml;
+  }
+  if(syms.length){
+    var ds=[];
+    if(activeTab==='ALL'){
+      syms.forEach(function(s,i){
+        var pts=pH[s]||[];
+        if(!pts.length)return;
+        var base=pts[0].mid;
+        if(!base)return;
+        ds.push({label:s,data:pts.filter(function(p){return p.mid!=null}).map(function(p){return{x:p.t,y:((p.mid-base)/base*100)}}),borderColor:COLORS[i%8],borderWidth:1.5,pointRadius:0,tension:0.3});
+      });
+    } else {
+      var pts=pH[activeTab]||[];
+      if(pts.length){
+        ds.push({label:activeTab,data:pts.filter(function(p){return p.mid!=null}).map(function(p){return{x:p.t,y:p.mid}}),borderColor:'#58a6ff',borderWidth:2,pointRadius:0,tension:0.3});
+        var ap=prods.find(function(p){return p.product===activeTab});
+        if(ap&&ap.alpha_fair!=null&&pts.length>1){
+          var fv=ap.alpha_fair;
+          ds.push({label:'Fair (alpha)',data:[{x:pts[0].t,y:fv},{x:pts[pts.length-1].t,y:fv}],borderColor:'#d29922',borderWidth:1.5,pointRadius:0,borderDash:[6,4]});
+        }
+        var bidPts=pts.filter(function(p){return p.bid!=null});
+        if(bidPts.length) ds.push({label:'Bid',data:bidPts.map(function(p){return{x:p.t,y:p.bid}}),borderColor:'rgba(63,185,80,0.3)',borderWidth:1,pointRadius:0});
+        var askPts=pts.filter(function(p){return p.ask!=null});
+        if(askPts.length) ds.push({label:'Ask',data:askPts.map(function(p){return{x:p.t,y:p.ask}}),borderColor:'rgba(248,81,73,0.3)',borderWidth:1,pointRadius:0});
+      }
+    }
+    if(!chPrice) chPrice=mkChart($sel('#ch-price'),ds);
+    else updChart(chPrice,ds);
+  }
 
-  // -- Signal rejection breakdown --
-  const rej=r.rejection_breakdown||{};
-  const rejTotal=Object.values(rej).reduce((a,b)=>a+b,0)||1;
-  const rejHtml=Object.entries(rej).map(([k,v])=>`
-    <div class="card-sm">
-      <div style="display:flex;justify-content:space-between"><span class="dim">${k}</span><span class="yellow">${v}</span></div>
-      <div class="bar-bg"><div class="bar-fg" style="width:${(v/rejTotal*100)}%;background:#d29922"></div></div>
-    </div>
-  `).join('');
-  $('#signal-section').innerHTML=rejHtml||'<div class="card"><div class="dim">No rejections yet</div></div>';
+  // 5. Arbitrage
+  var alphaETF=arb.alpha_etf_fair;
+  var etfHtml='<div class="lbl">LON_ETF Arbitrage</div>'+
+    '<div class="mr"><span class="dim">ETF Market</span><span class="wht big">'+fmt(arb.etf_mid,0)+'</span></div>'+
+    '<div class="mr"><span class="dim">Component Fair</span><span class="grn">'+fmt(arb.fair_etf,0)+'</span></div>';
+  if(alphaETF) etfHtml+='<div class="mr"><span class="dim">Alpha Fair</span><span class="blu">'+fmt(alphaETF,0)+'</span></div>';
+  etfHtml+='<div class="mr" style="margin-top:4px;padding-top:4px;border-top:1px solid var(--border)"><span class="dim">Gap (Mid-Fair)</span><span class="big '+clr(arb.gap)+'">'+fmt(arb.gap,0)+'</span></div>'+
+    '<div style="margin-top:6px">'+
+    '<div class="mr sm"><span class="dim">TIDE_SPOT</span><span>'+fmt(arb.tide_mid,0)+'</span></div>'+
+    '<div class="mr sm"><span class="dim">WX_SPOT</span><span>'+fmt(arb.wx_mid,0)+'</span></div>'+
+    '<div class="mr sm"><span class="dim">LHR_COUNT</span><span>'+fmt(arb.lhr_mid,0)+'</span></div>'+
+  '</div>';
+  $sel('#arb-etf').innerHTML=etfHtml;
 
-  // -- Market Volume --
-  const tvol=state.trade_volume||{};
-  const tcnt=state.trade_count||{};
-  const totalVol=Object.values(tvol).reduce((a,b)=>a+b,0);
-  const totalCnt=Object.values(tcnt).reduce((a,b)=>a+b,0);
-  const maxVol=Math.max(...Object.values(tvol),1);
-  const volSorted=Object.entries(tvol).sort((a,b)=>b[1]-a[1]);
-  let volSecHtml=`<div class="card-sm" style="min-width:200px">
-    <div class="dim">Session Totals</div>
-    <div class="big white">${totalVol.toLocaleString()} contracts</div>
-    <div class="dim" style="font-size:11px">${totalCnt} trades across ${Object.keys(tvol).length} products</div>
-  </div>`;
-  volSorted.forEach(([prod,vol])=>{
-    const cnt=tcnt[prod]||0;
-    const pct=(vol/maxVol*100).toFixed(0);
-    const low=vol<50;
-    volSecHtml+=`<div class="card-sm">
-      <div style="display:flex;justify-content:space-between"><strong class="${low?'red':'white'}">${prod}</strong><span class="${low?'red':'yellow'}">${vol.toLocaleString()}</span></div>
-      <div class="bar-bg"><div class="bar-fg" style="width:${pct}%;background:${low?'#f85149':'#58a6ff'}"></div></div>
-      <div class="dim" style="font-size:11px">${cnt} trades${low?' \u26a0\ufe0f LOW VOLUME':''}</div>
-    </div>`;
+  var flyHtml='<div class="lbl">LON_FLY Arbitrage</div>'+
+    '<div class="mr"><span class="dim">FLY Market</span><span class="wht big">'+fmt(arb.fly_mid,0)+'</span></div>'+
+    '<div class="mr"><span class="dim">FLY Fair</span><span class="grn">'+fmt(arb.fly_fair,0)+'</span></div>';
+  if(arb.fly_mid!=null&&arb.fly_fair!=null){
+    flyHtml+='<div class="mr" style="margin-top:4px;padding-top:4px;border-top:1px solid var(--border)"><span class="dim">Gap</span><span class="big '+clr(arb.fly_mid-arb.fly_fair)+'">'+fmt(arb.fly_mid-arb.fly_fair,0)+'</span></div>';
+  }
+  flyHtml+='<div class="sm dim" style="margin-top:6px">2xPut(6200) + Call(6200) - 2xCall(6600) + 3xCall(7000)</div>';
+  $sel('#arb-fly').innerHTML=flyHtml;
+
+  // Arb chart
+  var arbH=S.arb_history||[];
+  if(arbH.length){
+    var arbDs=[
+      {label:'ETF Mid',data:arbH.map(function(d){return{x:d.t,y:d.etf_mid}}),borderColor:'#58a6ff',borderWidth:1.5,pointRadius:0,tension:0.3},
+      {label:'Fair Value',data:arbH.map(function(d){return{x:d.t,y:d.fair}}),borderColor:'#3fb950',borderWidth:1.5,pointRadius:0,tension:0.3,borderDash:[4,4]}
+    ];
+    if(!chArb) chArb=mkChart($sel('#ch-arb'),arbDs);
+    else updChart(chArb,arbDs);
+  }
+
+  // 6. Order books
+  var obs=S.orderbooks||{};
+  var obHtml='';
+  prods.forEach(function(p){
+    var sym=p.product;
+    var ob=obs[sym];
+    if(!ob)return;
+    var bids=ob.bids||[];
+    var asks=ob.asks||[];
+    var allVols=bids.map(function(b){return b.vol}).concat(asks.map(function(a){return a.vol}));
+    var maxV=Math.max.apply(null,allVols.concat([1]));
+    var rows='';
+    asks.slice().reverse().forEach(function(a){
+      var w=(a.vol/maxV*100).toFixed(0);
+      rows+='<div class="depth-row"><span class="d-vol"></span><div class="d-left"></div><span class="d-price red">'+fmt(a.price,0)+'</span><div class="d-right"><div class="d-bar" style="width:'+w+'%;background:var(--red)"></div></div><span class="d-vol">'+a.vol+'</span></div>';
+    });
+    rows+='<div class="depth-row" style="justify-content:center"><span class="dim" style="font-size:10px">sprd: '+fmt(p.spread,0)+'</span></div>';
+    bids.forEach(function(b){
+      var w=(b.vol/maxV*100).toFixed(0);
+      rows+='<div class="depth-row"><span class="d-vol">'+b.vol+'</span><div class="d-left"><div class="d-bar" style="width:'+w+'%;background:var(--green)"></div></div><span class="d-price grn">'+fmt(b.price,0)+'</span><div class="d-right"></div><span class="d-vol"></span></div>';
+    });
+    obHtml+='<div class="c-tight"><div style="display:flex;justify-content:space-between;margin-bottom:3px"><strong class="wht">'+sym+'</strong><span class="dim sm">'+posBar(p.position)+'</span></div>'+rows+'</div>';
   });
-  $('#volume-section').innerHTML=volSecHtml||'<div class="card"><div class="dim">No trades yet</div></div>';
+  $sel('#ob-row').innerHTML=obHtml||'<div class="c-tight dim">No data</div>';
+
+  // 7. Strategy table + trade log
+  if(sim){
+    var sp=sim.strategy_pnl||{};
+    var st=sim.strategy_trades||{};
+    var strats=Object.keys(sp).sort(function(a,b){return(sp[b]||0)-(sp[a]||0)});
+    var sh='<div class="lbl">Per-Strategy Attribution (Simulated)</div><table><thead><tr><th>Strategy</th><th>PnL</th><th>Trades</th><th>PnL/Trade</th></tr></thead><tbody>';
+    strats.forEach(function(s){
+      var pnl=sp[s]||0;
+      var trades=st[s]||0;
+      var avg=trades?pnl/trades:0;
+      var name=s.replace('dispatch_','');
+      sh+='<tr><td class="wht">'+name+'</td><td class="'+clr(pnl)+'">'+fmt(pnl,0)+'</td><td>'+trades+'</td><td class="'+clr(avg)+'">'+fmt(avg,0)+'</td></tr>';
+    });
+    sh+='</tbody></table>';
+    $sel('#strat-table').innerHTML=sh;
+
+    var recent=sim.recent_trades||[];
+    var tlb=$sel('#trade-log tbody');
+    tlb.innerHTML=recent.slice().reverse().map(function(t){
+      var d=new Date(t.time*1000);
+      var ts=d.getHours()+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0');
+      return '<tr><td class="dim">'+ts+'</td><td class="sm">'+(t.strategy||'').replace('dispatch_','')+'</td><td class="'+(t.side==='BUY'?'grn':'red')+'">'+t.side+'</td><td class="wht">'+t.product+'</td><td>'+t.volume+'</td><td>'+fmt(t.price,0)+'</td><td class="'+clr(t.realized_pnl)+'">'+(t.realized_pnl?fmt(t.realized_pnl,0):'\u2014')+'</td></tr>';
+    }).join('');
+  } else {
+    $sel('#strat-table').innerHTML='<div class="dim sm">Strategy data available after first trades</div>';
+  }
+
+  // 8. Risk and rejections
+  var rej=r.rejections||{};
+  var rejKeys=Object.keys(rej);
+  var rejTotal=Object.values(rej).reduce(function(a,b){return a+b},0)||1;
+  var rh='<div class="c-tight">'+
+    '<div class="lbl">Risk Summary</div>'+
+    '<div class="mr"><span class="dim">PnL (local)</span><span class="'+clr(r.pnl)+'">'+fmt(r.pnl,0)+'</span></div>'+
+    '<div class="mr"><span class="dim">Peak</span><span>'+fmt(r.peak_pnl,0)+'</span></div>'+
+    '<div class="mr"><span class="dim">Drawdown</span><span class="'+clr(r.drawdown)+'">'+fmt(r.drawdown,0)+'</span></div>'+
+    '<div class="mr"><span class="dim">Active Orders</span><span>'+(S.active_orders||0)+'</span></div>';
+  if(r.strategies_halted&&r.strategies_halted.length) rh+='<div class="mr"><span class="dim">Halted Strats</span><span class="red">'+r.strategies_halted.join(", ")+'</span></div>';
+  rh+='</div>';
+  if(rejKeys.length){
+    var rejTotalV=Object.values(rej).reduce(function(a,b){return a+b},0);
+    rh+='<div class="c-tight"><div class="lbl">Rejection Breakdown ('+rejTotalV+' total)</div>';
+    rejKeys.sort(function(a,b){return rej[b]-rej[a]}).forEach(function(k){
+      rh+='<div class="mr"><span class="dim">'+k+'</span><span class="ylw">'+rej[k]+'</span></div><div class="bar-t"><div class="bar-f" style="width:'+(rej[k]/rejTotal*100)+'%;background:var(--yellow)"></div></div>';
+    });
+    rh+='</div>';
+  }
+  var tvol=S.trade_volume||{};
+  var totalVol=Object.values(tvol).reduce(function(a,b){return a+b},0);
+  if(totalVol){
+    rh+='<div class="c-tight"><div class="lbl">Session Volume: '+totalVol.toLocaleString()+' contracts</div>';
+    Object.entries(tvol).sort(function(a,b){return b[1]-a[1]}).forEach(function(e){
+      rh+='<div class="mr sm"><span class="dim">'+e[0]+'</span><span>'+e[1].toLocaleString()+'</span></div>';
+    });
+    rh+='</div>';
+  }
+  $sel('#risk-row').innerHTML=rh;
 }
 
-function setTab(tab){
-  activePriceTab=tab;
-  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.toggle('active',b.textContent.trim().startsWith(tab)));
-  // Force chart rebuild on tab switch
-  if(priceChart){priceChart.destroy();priceChart=null;}
+function setTab(t){
+  activeTab=t;
+  document.querySelectorAll('#p-tabs .tab').forEach(function(b){b.classList.toggle('on',b.textContent.trim()===t||(b.textContent.trim()==='ALL %'&&t==='ALL'))});
+  if(chPrice){chPrice.destroy();chPrice=null;}
 }
 
-async function loadFullHistory(){
-  const btn=$('#history-btn');
-  const status=$('#history-status');
-  if(historyMode){
-    historyMode=false;
-    btn.textContent='Load Full History';
-    btn.style.background='#238636';
-    status.textContent='';
-    if(priceChart){priceChart.destroy();priceChart=null;}
-    return;
-  }
-  btn.textContent='Loading...';
-  btn.disabled=true;
-  status.textContent='Fetching CSV data from disk...';
-  try{
-    const resp=await fetch('/api/history');
-    const data=await resp.json();
-    if(data.error){status.textContent='Error: '+data.error;btn.textContent='Load Full History';btn.disabled=false;return;}
-    fullHistoryData=data.price_history||{};
-    const totalPts=Object.values(fullHistoryData).reduce((a,b)=>a+b.length,0);
-    const trades=(data.trade_history||[]).length;
-    historyMode=true;
-    btn.textContent='Switch to Live';
-    btn.style.background='#8b949e';
-    btn.disabled=false;
-    status.textContent=`Showing ${totalPts.toLocaleString()} data points + ${trades} trades from disk`;
-    if(priceChart){priceChart.destroy();priceChart=null;}
-    // Force tab rebuild
-    $('#price-tabs').innerHTML='';
-    $('#price-tabs').dataset.syms='';
-  }catch(e){
-    status.textContent='Error: '+e.message;
-    btn.textContent='Load Full History';
-    btn.disabled=false;
-  }
+function toggleHistory(){
+  var btn=$sel('#hist-btn'), st=$sel('#hist-status');
+  if(histMode){histMode=false;btn.textContent='Load History';st.textContent='';if(chPrice){chPrice.destroy();chPrice=null;$sel('#p-tabs').innerHTML='';$sel('#p-tabs').dataset.k='';}return;}
+  btn.textContent='...';btn.disabled=true;st.textContent='Loading CSVs...';
+  fetch('/api/history').then(function(r){return r.json()}).then(function(d){
+    if(d.error){st.textContent='Error: '+d.error;btn.textContent='Load History';btn.disabled=false;return;}
+    histData=d.price_history||{};
+    var pts=Object.values(histData).reduce(function(a,b){return a+b.length},0);
+    histMode=true;btn.textContent='Live Mode';btn.disabled=false;
+    st.textContent=pts.toLocaleString()+' points loaded';
+    if(chPrice){chPrice.destroy();chPrice=null;$sel('#p-tabs').innerHTML='';$sel('#p-tabs').dataset.k='';}
+  }).catch(function(e){st.textContent='Error: '+e.message;btn.textContent='Load History';btn.disabled=false;});
 }
 
-async function poll(){
-  try{
-    const resp=await fetch('/api/state');
-    const data=await resp.json();
-    render(data);
-    const d=new Date(data.time*1000);
-    $('#last-update').textContent='Updated '+d.toLocaleTimeString();
-  }catch(e){
-    $('#last-update').textContent='Error: '+e.message;
-  }
+function poll(){
+  fetch('/api/state').then(function(r){return r.json()}).then(function(d){render(d)}).catch(function(e){$sel('#clock').textContent='Error: '+e.message});
 }
 
 setInterval(poll,2500);
