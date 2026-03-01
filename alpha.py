@@ -186,25 +186,107 @@ class AlphaEngine:
     # FAIR VALUE COMPUTATION
     # ================================================================
 
+    def _extrapolate_tide(self, target: datetime) -> float | None:
+        """Extrapolate tidal level at `target` time using multi-harmonic fit.
+
+        Thames tides are driven by multiple constituents:
+            M2  12.42 h   principal lunar semi-diurnal
+            S2  12.00 h   principal solar semi-diurnal
+            M4   6.21 h   quarter-diurnal (tidal asymmetry)
+
+        With 200 readings (~50 h) we observe ~4 full M2 cycles — enough
+        to resolve all three. Fit is linear least-squares (fast, stable).
+
+        Fit:  level(t) = c0 + Σ [a_k sin(ω_k t) + b_k cos(ω_k t)]
+
+        Evaluated at the target (settlement) time.
+        """
+        import numpy as np
+
+        if self._tidal is None or len(self._tidal) < 20:
+            return None
+
+        df = self._tidal.copy()
+        # Convert times to hours-since-first-reading
+        t0 = df["time"].iloc[0]
+        hours = (df["time"] - t0).dt.total_seconds().values / 3600.0
+        levels = df["level"].values.astype(float)
+
+        # Target in same coordinate
+        target_h = (target - t0).total_seconds() / 3600.0
+
+        # Tidal periods (hours)
+        PERIODS = [12.42, 12.00, 6.21]  # M2, S2, M4
+
+        # Build design matrix: [1, sin(ω1 t), cos(ω1 t), sin(ω2 t), ...]
+        cols = [np.ones_like(hours)]
+        for T in PERIODS:
+            w = 2 * np.pi / T
+            cols.append(np.sin(w * hours))
+            cols.append(np.cos(w * hours))
+        A_mat = np.column_stack(cols)
+
+        try:
+            coeffs = np.linalg.lstsq(A_mat, levels, rcond=None)[0]
+        except Exception:
+            return None
+
+        # Evaluate at target
+        predicted = coeffs[0]
+        for i, T in enumerate(PERIODS):
+            w = 2 * np.pi / T
+            predicted += (coeffs[2 * i + 1] * np.sin(w * target_h)
+                          + coeffs[2 * i + 2] * np.cos(w * target_h))
+
+        # Sanity check: prediction should be within observed range ± 50%
+        lvl_min, lvl_max = levels.min(), levels.max()
+        lvl_range = lvl_max - lvl_min
+        if predicted < lvl_min - 0.5 * lvl_range:
+            predicted = lvl_min
+        if predicted > lvl_max + 0.5 * lvl_range:
+            predicted = lvl_max
+
+        return float(predicted)
+
     def _compute(self, mids: dict[str, float]):
         fv: dict[str, float] = {}
         cf: dict[str, float] = {}
         hl = self._hours_left()
 
-        # ── TIDE_SPOT = abs(level_mm) at settlement ─────────────────
-        # EA gives actual readings (not forecasts). Latest reading is best estimate.
-        # Tides change slowly (~2m over 6h), so confidence rises near settlement.
+        # ── TIDE_SPOT = abs(level_mAOD) * 1000 at settlement ───────
+        # Settlement formula: ABS(water level in mAOD at Sunday 12:00) * 1000
+        # EA gives HISTORICAL readings (not forecasts). Tides swing ~4m in 6h.
+        # Must extrapolate to settlement using sinusoidal tidal model.
         if self._tidal is not None and not self._tidal.empty:
             try:
-                lvl = float(self._tidal.iloc[-1]["level"])
-                fv["TIDE_SPOT"] = abs(lvl * 1000)
-                # Higher confidence closer to settlement
-                cf["TIDE_SPOT"] = max(0.20, min(0.95, 1.0 - hl / 24))
+                settlement = self._next_settlement()
+                if hl < 0.5:
+                    # Very close to settlement — use latest reading directly
+                    lvl = float(self._tidal.iloc[-1]["level"])
+                    fv["TIDE_SPOT"] = abs(lvl) * 1000
+                    cf["TIDE_SPOT"] = max(0.70, min(0.95, 1.0 - hl / 2))
+                else:
+                    # Extrapolate using sinusoidal fit
+                    predicted = self._extrapolate_tide(settlement)
+                    if predicted is not None:
+                        fv["TIDE_SPOT"] = abs(predicted) * 1000
+                        # Confidence: higher when closer + more data
+                        n_pts = len(self._tidal)
+                        data_quality = min(1.0, n_pts / 100)
+                        time_quality = max(0.10, 1.0 - hl / 12)
+                        cf["TIDE_SPOT"] = min(0.80, data_quality * time_quality)
+                    else:
+                        # Fallback: latest reading (poor estimate)
+                        lvl = float(self._tidal.iloc[-1]["level"])
+                        fv["TIDE_SPOT"] = abs(lvl) * 1000
+                        cf["TIDE_SPOT"] = 0.10  # very low confidence
             except Exception:
                 pass
 
         # ── TIDE_SWING = sum(strangle payoffs on 15-min diffs) ──────
         # Cumulative over session. Observe partial + extrapolate rest.
+        # Diff is in CENTIMETRES (level*100), payoff per interval:
+        #   max(0, 20 - |diff_cm|) + max(0, |diff_cm| - 25)
         if self._tidal is not None and len(self._tidal) > 1:
             try:
                 ss = self._session_start()
